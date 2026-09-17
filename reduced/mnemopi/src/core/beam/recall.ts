@@ -919,6 +919,17 @@ function collectMemoryCandidates(
 	return candidates;
 }
 
+/**
+ * Three-state query-embedding resolution: `null` (explicitly FTS-only) passes
+ * through untouched; `undefined` derives the vector from the query text via
+ * `embedQuery()` — null when no provider is configured, so recall falls back
+ * to FTS-only.
+ */
+async function resolveQueryEmbedding(query: string): Promise<number[] | null> {
+	const derived = query.length > 0 ? await embedQuery(query) : null;
+	return derived === null ? null : Array.from(derived);
+}
+
 export async function recall(
 	beam: BeamMemoryState,
 	query: string,
@@ -933,11 +944,7 @@ export async function recall(
 		temporalOptions.currentSensitive = true;
 	}
 	if (temporalOptions.queryEmbedding === undefined) {
-		// Honour `null` (explicit "no embedding"); `undefined` means "derive from
-		// query text". `embedQuery()` returns null when embeddings are disabled or
-		// no provider is configured, so this is a no-op when none is wired up.
-		const derived = query.length > 0 ? await embedQuery(query) : null;
-		temporalOptions.queryEmbedding = derived === null ? null : Array.from(derived);
+		temporalOptions.queryEmbedding = await resolveQueryEmbedding(query);
 	}
 	let weights = normalizedRecallWeights(
 		options.vecWeight ?? beam.config.vecWeight,
@@ -949,19 +956,19 @@ export async function recall(
 		weights = adjustWeights(weights[0], weights[1], weights[2], intent);
 	}
 	const useSynonyms = options.useSynonyms !== false;
-	const tokens = expandedTokens(query, useSynonyms);
-	const tokenGroups = expandedTokenGroups(query, useSynonyms);
-	const normalized = normalizeQuery(query).toLowerCase();
+	const queryTokens = expandedTokens(query, useSynonyms);
+	const queryTokenGroups = expandedTokenGroups(query, useSynonyms);
+	const normalizedQuery = normalizeQuery(query).toLowerCase();
 	const candidates = collectMemoryCandidates(beam, query, topK, temporalOptions);
 	const scored: RecallResult[] = [];
 	for (const candidate of candidates) {
-		const result = scoreCandidate(candidate, tokens, tokenGroups, normalized, weights, temporalOptions);
+		const result = scoreCandidate(candidate, queryTokens, queryTokenGroups, normalizedQuery, weights, temporalOptions);
 		if (result !== null) scored.push(result);
 	}
 	scored.sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
 	let finalResults = dedupCrossTierSummaryLinks(beam, dedupeResults(scored));
-	if (query.length > 0 && tokens.length >= 4 && finalResults.length > topK)
-		finalResults = diversifyByCoverage(finalResults, tokens, topK);
+	if (query.length > 0 && queryTokens.length >= 4 && finalResults.length > topK)
+		finalResults = diversifyByCoverage(finalResults, queryTokens, topK);
 	if (options.useMmr === true && finalResults.length > 1) {
 		finalResults = rerankRecallResults(finalResults, options.mmrLambda ?? 0.7, topK);
 	} else {
@@ -1096,11 +1103,10 @@ export function formatContext(beam: BeamMemoryState, results: readonly RecallRes
 	return lines.join("\n");
 }
 
-export function factRecall(beam: BeamMemoryState, query: string, topK = 30): FactRecallResult[] {
-	if (topK <= 0) return [];
-	let matched: Row[] = [];
+/** Full-text match of fact triples; ranks come from FTS5 ordering. */
+function matchFactRowidsByFts(beam: BeamMemoryState, query: string, topK: number): Row[] {
 	const visibility = factVisibilityWhere(beam, "facts");
-	matched = queryAll(
+	return queryAll(
 		beam,
 		`SELECT fts_facts.rowid, fts_facts.rank
 		 FROM fts_facts
@@ -1110,38 +1116,48 @@ export function factRecall(beam: BeamMemoryState, query: string, topK = 30): Fac
 		 LIMIT ?`,
 		[ftsQuery(query), ...visibility.params, topK * 3],
 	);
-	if (matched.length === 0) {
-		const seen = new Set<number>();
-		for (const token of expandedTokens(query).slice(0, 6)) {
-			const likeVisibility = factVisibilityWhere(beam, "");
-			const rows = queryAll(
-				beam,
-				`SELECT rowid
-				 FROM facts
-				 WHERE (subject LIKE ? OR predicate LIKE ? OR object LIKE ?) AND ${visibility.where}
-				 LIMIT ?`,
-				[`%${token}%`, `%${token}%`, `%${token}%`, ...likeVisibility.params, topK],
-			);
-			for (const row of rows) {
-				const rowid = asNumber(row.rowid);
-				if (rowid > 0 && !seen.has(rowid)) {
-					seen.add(rowid);
-					matched.push({ rowid, rank: 0 });
-				}
+}
+
+/** LIKE fallback for fact matching; all hits share rank 0. */
+function matchFactRowidsByLike(beam: BeamMemoryState, query: string, topK: number): Row[] {
+	const seen = new Set<number>();
+	const matched: Row[] = [];
+	for (const token of expandedTokens(query).slice(0, 6)) {
+		const likeVisibility = factVisibilityWhere(beam, "");
+		const rows = queryAll(
+			beam,
+			`SELECT rowid
+			 FROM facts
+			 WHERE (subject LIKE ? OR predicate LIKE ? OR object LIKE ?) AND ${likeVisibility.where}
+			 LIMIT ?`,
+			[`%${token}%`, `%${token}%`, `%${token}%`, ...likeVisibility.params, topK],
+		);
+		for (const row of rows) {
+			const rowid = asNumber(row.rowid);
+			if (rowid > 0 && !seen.has(rowid)) {
+				seen.add(rowid);
+				matched.push({ rowid, rank: 0 });
 			}
 		}
 	}
+	return matched;
+}
+
+export function factRecall(beam: BeamMemoryState, query: string, topK = 30): FactRecallResult[] {
+	if (topK <= 0) return [];
+	let matched = matchFactRowidsByFts(beam, query, topK);
+	if (matched.length === 0) matched = matchFactRowidsByLike(beam, query, topK);
 	if (matched.length === 0) return [];
 	const rowids = matched.map(row => asNumber(row.rowid)).filter(rowid => rowid > 0);
 	if (rowids.length === 0) return [];
 	const finalVisibility = factVisibilityWhere(beam, "");
 	const ranks = normalizeRanks(matched, "rowid");
-	const normalized = normalizeQuery(query).toLowerCase();
+	const normalizedQuery = normalizeQuery(query).toLowerCase();
 	const rows = queryAll(
 		beam,
 		`SELECT rowid, fact_id, subject, predicate, object, timestamp, confidence
 		 FROM facts
-		 WHERE rowid IN (${placeholders(rowids.length)}) AND ${visibility.where}
+		 WHERE rowid IN (${placeholders(rowids.length)}) AND ${finalVisibility.where}
 		 ORDER BY confidence DESC
 		 LIMIT ?`,
 		[...rowids, ...finalVisibility.params, rowids.length],
@@ -1158,8 +1174,8 @@ export function factRecall(beam: BeamMemoryState, query: string, topK = 30): Fac
 			const queryTokens = tokensFromGroups(queryGroups);
 			const lexical =
 				queryGroups.length > 0
-					? lexicalGroupRelevance(queryGroups, searchable, normalized)
-					: lexicalRelevance(queryTokens, searchable, normalized);
+					? lexicalGroupRelevance(queryGroups, searchable, normalizedQuery)
+					: lexicalRelevance(queryTokens, searchable, normalizedQuery);
 			const rank = ranks.get(asNumber(row.rowid)) ?? 0;
 			const result: FactRecallResult = {
 				id: asString(row.fact_id),

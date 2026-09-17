@@ -272,53 +272,72 @@ function invalidateEpisodicVectors(beam: BeamMemoryState, memoryId: string): voi
 	beam.db.run("DELETE FROM memory_embeddings WHERE memory_id = ?", [memoryId]);
 }
 
+type TierPlan = {
+	rows: Row[];
+	fromTier: number;
+	toTier: number;
+	compress: (content: string) => string;
+	countKey: "tier1_to_tier2" | "tier2_to_tier3";
+};
+
+/** Compress tier-1 content by hard clip; tier-2 by signal extraction. */
+function degradePlan(beam: BeamMemoryState, now: string, dryRun: boolean): TierPlan[] {
+	const clipTo800 = (content: string): string => content.slice(0, 800);
+	const extractSignal = (content: string): string =>
+		content.length > TIER3_MAX_CHARS ? extractKeySignal(content, TIER3_MAX_CHARS) : content;
+	return [
+		{
+			rows: asRows(
+				beam.db
+					.query(
+						`SELECT id, content FROM episodic_memory WHERE tier = 1 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+					)
+					.all(cutoffIso(TIER2_DAYS, 24 * 60 * 60 * 1000), DEGRADE_BATCH_SIZE),
+			),
+			fromTier: 1,
+			toTier: 2,
+			compress: clipTo800,
+			countKey: "tier1_to_tier2",
+		},
+		{
+			rows: asRows(
+				beam.db
+					.query(
+						`SELECT id, content FROM episodic_memory WHERE tier = 2 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+					)
+					.all(cutoffIso(TIER3_DAYS, 24 * 60 * 60 * 1000), Math.max(1, Math.floor(DEGRADE_BATCH_SIZE / 2))),
+			),
+			fromTier: 2,
+			toTier: 3,
+			compress: extractSignal,
+			countKey: "tier2_to_tier3",
+		},
+	];
+}
+
 export function degradeEpisodic(beam: BeamMemoryState, dryRun = false): Record<string, JsonValue> {
 	const now = nowIso();
-	const tier2Cutoff = cutoffIso(TIER2_DAYS, 24 * 60 * 60 * 1000);
-	const tier3Cutoff = cutoffIso(TIER3_DAYS, 24 * 60 * 60 * 1000);
-	const tier1Rows = asRows(
-		beam.db
-			.query(
-				`SELECT id, content FROM episodic_memory WHERE tier = 1 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
-			)
-			.all(tier2Cutoff, DEGRADE_BATCH_SIZE),
-	);
-	const tier2Rows = asRows(
-		beam.db
-			.query(
-				`SELECT id, content FROM episodic_memory WHERE tier = 2 AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
-			)
-			.all(tier3Cutoff, Math.max(1, Math.floor(DEGRADE_BATCH_SIZE / 2))),
-	);
-	const result = {
+	const result: Record<string, JsonValue> = {
 		status: dryRun ? "dry_run" : "degraded",
-		tier1_to_tier2: tier1Rows.length,
-		tier2_to_tier3: tier2Rows.length,
+		tier1_to_tier2: 0,
+		tier2_to_tier3: 0,
 	};
-	if (dryRun) return result;
-	for (const row of tier1Rows) {
-		const id = rowValue(row, "id");
-		const content = rowValue(row, "content") ?? "";
-		if (!id) continue;
-		const compressed = content.slice(0, 800);
-		beam.db.run("UPDATE episodic_memory SET content = ?, tier = 2, degraded_at = ? WHERE id = ?", [
-			compressed,
-			now,
-			id,
-		]);
-		if (compressed !== content) invalidateEpisodicVectors(beam, id);
-	}
-	for (const row of tier2Rows) {
-		const id = rowValue(row, "id");
-		const content = rowValue(row, "content") ?? "";
-		if (!id) continue;
-		const compressed = content.length > TIER3_MAX_CHARS ? extractKeySignal(content, TIER3_MAX_CHARS) : content;
-		beam.db.run("UPDATE episodic_memory SET content = ?, tier = 3, degraded_at = ? WHERE id = ?", [
-			compressed,
-			now,
-			id,
-		]);
-		if (compressed !== content) invalidateEpisodicVectors(beam, id);
+	for (const plan of degradePlan(beam, now, dryRun)) {
+		result[plan.countKey] = plan.rows.length;
+		if (dryRun) continue;
+		for (const row of plan.rows) {
+			const id = rowValue(row, "id");
+			const content = rowValue(row, "content") ?? "";
+			if (!id) continue;
+			const compressed = plan.compress(content);
+			beam.db.run("UPDATE episodic_memory SET content = ?, tier = ?, degraded_at = ? WHERE id = ?", [
+				compressed,
+				plan.toTier,
+				now,
+				id,
+			]);
+			if (compressed !== content) invalidateEpisodicVectors(beam, id);
+		}
 	}
 	return result;
 }
@@ -449,6 +468,16 @@ export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
 	};
 }
 
+/** Run sleep as one session by cloning the beam state with that session's ids. */
+function sleepOneSession(beam: BeamMemoryState, sessionId: string, eligible: number, dryRun: boolean): Row {
+	const scoped = Object.create(Object.getPrototypeOf(beam)) as BeamMemoryState;
+	Object.assign(scoped, beam, { sessionId, channelId: sessionId });
+	const result = sleep(scoped, dryRun) as Row;
+	result.session_id = sessionId;
+	result.eligible = eligible;
+	return result;
+}
+
 export function sleepAllSessions(beam: BeamMemoryState, dryRun = false): SleepResult {
 	const ttl = beam.config?.workingMemoryTtlHours ?? 24;
 	const cutoff = cutoffIso(Math.floor(ttl / 2), 60 * 60 * 1000);
@@ -481,11 +510,7 @@ export function sleepAllSessions(beam: BeamMemoryState, dryRun = false): SleepRe
 	let consolidated = 0;
 	for (const row of sessions) {
 		const sessionId = rowValue(row, "session_id") ?? "default";
-		const scoped = Object.create(Object.getPrototypeOf(beam)) as BeamMemoryState;
-		Object.assign(scoped, beam, { sessionId, channelId: sessionId });
-		const result = sleep(scoped, dryRun) as Row;
-		result.session_id = sessionId;
-		result.eligible = row.eligible;
+		const result = sleepOneSession(beam, sessionId, Number(row.eligible ?? 0), dryRun) as Row;
 		results.push(result);
 		if (result.status === "consolidated" || result.status === "dry_run") consolidated++;
 		items += Number(result.items_consolidated ?? 0);

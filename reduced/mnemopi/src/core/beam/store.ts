@@ -14,7 +14,7 @@ import { generateId } from "../../util/ids";
 import { scratchpadMaxItems } from "../../config";
 import { emitEvent, type EventPayload } from "./events";
 import { metadataJson } from "./helpers";
-import { scopeFilterClauses } from "./row";
+import { asRows, scopeFilterClauses } from "./row";
 import type {
 	BeamMemoryState,
 	BeamStats,
@@ -661,165 +661,209 @@ export function exportToDict(beam: BeamMemoryState): Record<string, unknown> {
 	};
 }
 
+type ImportTableStats = {
+	working_memory: { inserted: number; skipped: number; overwritten: number };
+	episodic_memory: { inserted: number; skipped: number; overwritten: number; embeddings_inserted: number };
+	scratchpad: { inserted: number; updated: number };
+	consolidation_log: { inserted: number };
+};
+
+/** Import working-memory rows; force overwrites cascade-purge the replaced row's artifacts. */
+function importWorkingMemoryRows(
+	db: BeamMemoryState["db"],
+	rows: readonly unknown[],
+	force: boolean,
+	stats: ImportTableStats["working_memory"],
+	importedAt: string,
+): void {
+	for (const raw of rows) {
+		const item = jsonObject(raw);
+		const id = String(item.id ?? "");
+		if (id.length === 0) continue;
+		const exists = db.prepare("SELECT 1 FROM working_memory WHERE id = ?").get(id) !== null;
+		if (exists && !force) {
+			stats.skipped++;
+			continue;
+		}
+		if (exists) {
+			db.run("DELETE FROM working_memory WHERE id = ?", [id]);
+			purgeWorkingMemoryArtifacts(db, [id]);
+			stats.overwritten++;
+		} else {
+			stats.inserted++;
+		}
+		db.run(
+			`
+			INSERT INTO working_memory
+			(id, content, source, timestamp, session_id, importance, metadata_json,
+			 valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
+			 veracity, consolidated_at, memory_type, embed_text, author_id, author_type, channel_id,
+			 trust_tier, event_date, event_date_precision, temporal_tags)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			[
+				id,
+				sqlBinding(item.content, ""),
+				sqlBinding(item.source, null),
+				sqlBinding(item.timestamp, null),
+				sqlBinding(item.session_id, "default"),
+				sqlBinding(item.importance, 0.5),
+				sqlBinding(item.metadata_json, "{}"),
+				sqlBinding(item.valid_until, null),
+				sqlBinding(item.superseded_by, null),
+				sqlBinding(item.scope, "session"),
+				sqlBinding(item.recall_count, 0),
+				sqlBinding(item.last_recalled, null),
+				sqlBinding(item.created_at, null),
+				clampVeracity(item.veracity),
+				// Imported rows are durable, not scratch: stamp unconsolidated ones so
+				// the TTL trim never discards a restored bank (issue #4819).
+				item.consolidated_at == null ? importedAt : sqlBinding(item.consolidated_at, importedAt),
+				sqlBinding(item.memory_type, "unknown"),
+				sqlBinding(item.embed_text, null),
+				sqlBinding(item.author_id, null),
+				sqlBinding(item.author_type, null),
+				sqlBinding(item.channel_id, null),
+				sqlBinding(item.trust_tier, "STATED"),
+				sqlBinding(item.event_date, null),
+				sqlBinding(item.event_date_precision, "unknown"),
+				sqlBinding(item.temporal_tags, "[]"),
+			],
+		);
+	}
+}
+
+/** Import episodic-memory rows (no vector sidecar import in the reduced copy). */
+function importEpisodicMemoryRows(
+	db: BeamMemoryState["db"],
+	rows: readonly unknown[],
+	force: boolean,
+	stats: ImportTableStats["episodic_memory"],
+): void {
+	for (const raw of rows) {
+		const item = jsonObject(raw);
+		const id = String(item.id ?? "");
+		if (id.length === 0) continue;
+		const exists = db.prepare("SELECT 1 FROM episodic_memory WHERE id = ?").get(id) !== null;
+		if (exists && !force) {
+			stats.skipped++;
+			continue;
+		}
+		if (exists) {
+			db.run("DELETE FROM episodic_memory WHERE id = ?", [id]);
+			stats.overwritten++;
+		} else {
+			stats.inserted++;
+		}
+		db.run(
+			`
+			INSERT INTO episodic_memory
+			(id, content, source, timestamp, session_id, importance, metadata_json,
+			 summary_of, valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
+			 veracity, memory_type, author_id, author_type, channel_id, trust_tier,
+			 event_date, event_date_precision, temporal_tags)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			[
+				id,
+				sqlBinding(item.content, ""),
+				sqlBinding(item.source, null),
+				sqlBinding(item.timestamp, null),
+				sqlBinding(item.session_id, "default"),
+				sqlBinding(item.importance, 0.5),
+				sqlBinding(item.metadata_json, "{}"),
+				sqlBinding(item.summary_of, ""),
+				sqlBinding(item.valid_until, null),
+				sqlBinding(item.superseded_by, null),
+				sqlBinding(item.scope, "session"),
+				sqlBinding(item.recall_count, 0),
+				sqlBinding(item.last_recalled, null),
+				sqlBinding(item.created_at, null),
+				clampVeracity(item.veracity),
+				sqlBinding(item.memory_type, "unknown"),
+				sqlBinding(item.author_id, null),
+				sqlBinding(item.author_type, null),
+				sqlBinding(item.channel_id, null),
+				sqlBinding(item.trust_tier, "STATED"),
+				sqlBinding(item.event_date, null),
+				sqlBinding(item.event_date_precision, "unknown"),
+				sqlBinding(item.temporal_tags, "[]"),
+			],
+		);
+	}
+}
+
+/** Upsert scratchpad rows by id (existing rows count as updated). */
+function importScratchpadRows(
+	db: BeamMemoryState["db"],
+	rows: readonly unknown[],
+	stats: ImportTableStats["scratchpad"],
+): void {
+	for (const raw of rows) {
+		const item = jsonObject(raw);
+		const id = String(item.id ?? "");
+		if (id.length === 0) continue;
+		const exists = db.prepare("SELECT 1 FROM scratchpad WHERE id = ?").get(id) !== null;
+		if (exists) {
+			db.run("UPDATE scratchpad SET content = ?, session_id = ?, created_at = ?, updated_at = ? WHERE id = ?", [
+				sqlBinding(item.content, ""),
+				sqlBinding(item.session_id, "default"),
+				sqlBinding(item.created_at, null),
+				sqlBinding(item.updated_at, null),
+				id,
+			]);
+			stats.updated++;
+		} else {
+			db.run("INSERT INTO scratchpad (id, content, session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", [
+				id,
+				sqlBinding(item.content, ""),
+				sqlBinding(item.session_id, "default"),
+				sqlBinding(item.created_at, null),
+				sqlBinding(item.updated_at, null),
+			]);
+			stats.inserted++;
+		}
+	}
+}
+
+/** Append consolidation-log rows verbatim (never deduplicated, matching export). */
+function importConsolidationLogRows(
+	db: BeamMemoryState["db"],
+	rows: readonly unknown[],
+	stats: ImportTableStats["consolidation_log"],
+): void {
+	for (const raw of rows) {
+		const item = jsonObject(raw);
+		db.run(
+			"INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at) VALUES (?, ?, ?, ?)",
+			[
+				sqlBinding(item.session_id, "default"),
+				sqlBinding(item.items_consolidated, 0),
+				sqlBinding(item.summary_preview, ""),
+				sqlBinding(item.created_at, null),
+			],
+		);
+		stats.inserted++;
+	}
+}
+
 export function importFromDict(beam: BeamMemoryState, data: Record<string, unknown>, force = false): ImportStats {
-	const stats = {
+	const stats: ImportTableStats = {
 		working_memory: { inserted: 0, skipped: 0, overwritten: 0 },
 		episodic_memory: { inserted: 0, skipped: 0, overwritten: 0, embeddings_inserted: 0 },
 		scratchpad: { inserted: 0, updated: 0 },
 		consolidation_log: { inserted: 0 },
-	} satisfies ImportStats;
-	const db: BeamMemoryState["db"] = beam.db;
-	// Imported working-memory rows are durable, not scratch: stamp any that
-	// arrive unconsolidated so the TTL trim never discards a restored bank
-	// (issue #4819).
+	};
+	const db = beam.db;
+	// Imported working-memory rows are durable, not scratch: the timestamp that
+	// marks restored banks as consolidated is decided here and stamped per row.
 	const importedAt = nowIso();
 
 	transaction(db, () => {
-		for (const raw of Array.isArray(data.working_memory) ? data.working_memory : []) {
-			const item = jsonObject(raw);
-			const id = String(item.id ?? "");
-			if (id.length === 0) continue;
-			const exists = db.prepare("SELECT 1 FROM working_memory WHERE id = ?").get(id) !== null;
-			if (exists && !force) {
-				stats.working_memory.skipped++;
-				continue;
-			}
-			if (exists) {
-				db.run("DELETE FROM working_memory WHERE id = ?", [id]);
-				purgeWorkingMemoryArtifacts(db, [id]);
-				stats.working_memory.overwritten++;
-			} else {
-				stats.working_memory.inserted++;
-			}
-			db.run(
-				`
-				INSERT INTO working_memory
-				(id, content, source, timestamp, session_id, importance, metadata_json,
-				 valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
-				 veracity, consolidated_at, memory_type, embed_text, author_id, author_type, channel_id,
-				 trust_tier, event_date, event_date_precision, temporal_tags)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			`,
-				[
-					id,
-					sqlBinding(item.content, ""),
-					sqlBinding(item.source, null),
-					sqlBinding(item.timestamp, null),
-					sqlBinding(item.session_id, "default"),
-					sqlBinding(item.importance, 0.5),
-					sqlBinding(item.metadata_json, "{}"),
-					sqlBinding(item.valid_until, null),
-					sqlBinding(item.superseded_by, null),
-					sqlBinding(item.scope, "session"),
-					sqlBinding(item.recall_count, 0),
-					sqlBinding(item.last_recalled, null),
-					sqlBinding(item.created_at, null),
-					clampVeracity(item.veracity),
-					item.consolidated_at == null ? importedAt : sqlBinding(item.consolidated_at, importedAt),
-					sqlBinding(item.memory_type, "unknown"),
-					sqlBinding(item.embed_text, null),
-					sqlBinding(item.author_id, null),
-					sqlBinding(item.author_type, null),
-					sqlBinding(item.channel_id, null),
-					sqlBinding(item.trust_tier, "STATED"),
-					sqlBinding(item.event_date, null),
-					sqlBinding(item.event_date_precision, "unknown"),
-					sqlBinding(item.temporal_tags, "[]"),
-				],
-			);
-		}
-
-		for (const raw of Array.isArray(data.episodic_memory) ? data.episodic_memory : []) {
-			const item = jsonObject(raw);
-			const id = String(item.id ?? "");
-			if (id.length === 0) continue;
-			const exists = db.prepare("SELECT 1 FROM episodic_memory WHERE id = ?").get(id) !== null;
-			if (exists && !force) {
-				stats.episodic_memory.skipped++;
-				continue;
-			}
-			if (exists) {
-				db.run("DELETE FROM episodic_memory WHERE id = ?", [id]);
-				stats.episodic_memory.overwritten++;
-			} else {
-				stats.episodic_memory.inserted++;
-			}
-			db.run(
-				`
-				INSERT INTO episodic_memory
-				(id, content, source, timestamp, session_id, importance, metadata_json,
-				 summary_of, valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
-				 veracity, memory_type, author_id, author_type, channel_id, trust_tier,
-				 event_date, event_date_precision, temporal_tags)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			`,
-				[
-					id,
-					sqlBinding(item.content, ""),
-					sqlBinding(item.source, null),
-					sqlBinding(item.timestamp, null),
-					sqlBinding(item.session_id, "default"),
-					sqlBinding(item.importance, 0.5),
-					sqlBinding(item.metadata_json, "{}"),
-					sqlBinding(item.summary_of, ""),
-					sqlBinding(item.valid_until, null),
-					sqlBinding(item.superseded_by, null),
-					sqlBinding(item.scope, "session"),
-					sqlBinding(item.recall_count, 0),
-					sqlBinding(item.last_recalled, null),
-					sqlBinding(item.created_at, null),
-					clampVeracity(item.veracity),
-					sqlBinding(item.memory_type, "unknown"),
-					sqlBinding(item.author_id, null),
-					sqlBinding(item.author_type, null),
-					sqlBinding(item.channel_id, null),
-					sqlBinding(item.trust_tier, "STATED"),
-					sqlBinding(item.event_date, null),
-					sqlBinding(item.event_date_precision, "unknown"),
-					sqlBinding(item.temporal_tags, "[]"),
-				],
-			);
-		}
-
-		for (const raw of Array.isArray(data.scratchpad) ? data.scratchpad : []) {
-			const item = jsonObject(raw);
-			const id = String(item.id ?? "");
-			if (id.length === 0) continue;
-			const exists = db.prepare("SELECT 1 FROM scratchpad WHERE id = ?").get(id) !== null;
-			if (exists) {
-				db.run("UPDATE scratchpad SET content = ?, session_id = ?, created_at = ?, updated_at = ? WHERE id = ?", [
-					sqlBinding(item.content, ""),
-					sqlBinding(item.session_id, "default"),
-					sqlBinding(item.created_at, null),
-					sqlBinding(item.updated_at, null),
-					id,
-				]);
-				stats.scratchpad.updated++;
-			} else {
-				db.run("INSERT INTO scratchpad (id, content, session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", [
-					id,
-					sqlBinding(item.content, ""),
-					sqlBinding(item.session_id, "default"),
-					sqlBinding(item.created_at, null),
-					sqlBinding(item.updated_at, null),
-				]);
-				stats.scratchpad.inserted++;
-			}
-		}
-
-		for (const raw of Array.isArray(data.consolidation_log) ? data.consolidation_log : []) {
-			const item = jsonObject(raw);
-			db.run(
-				"INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at) VALUES (?, ?, ?, ?)",
-				[
-					sqlBinding(item.session_id, "default"),
-					sqlBinding(item.items_consolidated, 0),
-					sqlBinding(item.summary_preview, ""),
-					sqlBinding(item.created_at, null),
-				],
-			);
-			stats.consolidation_log.inserted++;
-		}
+		importWorkingMemoryRows(db, asRows(data.working_memory), force, stats.working_memory, importedAt);
+		importEpisodicMemoryRows(db, asRows(data.episodic_memory), force, stats.episodic_memory);
+		importScratchpadRows(db, asRows(data.scratchpad), stats.scratchpad);
+		importConsolidationLogRows(db, asRows(data.consolidation_log), stats.consolidation_log);
 	});
 	return stats;
 }
