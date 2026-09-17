@@ -1,0 +1,10 @@
+{
+	"name": "mnemopi-reduced",
+	"version": "18.2.1",
+	"type": "module",
+	"description": "Educational reduced copy of packages/mnemopi: remember -> recall -> sleep workflow only",
+	"private": true,
+	"scripts": {
+		"test": "bun test"
+	}
+}
