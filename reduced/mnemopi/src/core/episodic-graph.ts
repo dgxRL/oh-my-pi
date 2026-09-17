@@ -136,18 +136,14 @@ export class EpisodicGraph {
 	}
 
 	private memoryContent(memoryId: string): string {
-		try {
-			const working = this.db.query("SELECT content FROM working_memory WHERE id = ?").get(memoryId) as
-				| { content: string }
-				| null;
-			if (working !== null) return working.content;
-			const episodic = this.db.query("SELECT content FROM episodic_memory WHERE id = ?").get(memoryId) as
-				| { content: string }
-				| null;
-			return episodic?.content ?? "";
-		} catch {
-			return "";
-		}
+		const working = this.db.query("SELECT content FROM working_memory WHERE id = ?").get(memoryId) as
+			| { content: string }
+			| null;
+		if (working !== null) return working.content;
+		const episodic = this.db.query("SELECT content FROM episodic_memory WHERE id = ?").get(memoryId) as
+			| { content: string }
+			| null;
+		return episodic?.content ?? "";
 	}
 
 	ingestMemory(content: string, memoryId: string, options: IngestOptions = {}): IngestResult {

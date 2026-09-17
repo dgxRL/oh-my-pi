@@ -72,22 +72,6 @@ function clamp01(value: number): number {
 	return value;
 }
 
-function asFiniteNonNegative(value: number): number {
-	return Number.isFinite(value) && value > 0 ? value : 0;
-}
-
-export function tableExists(db: Database, table: string): boolean {
-	try {
-		return (
-			db
-				.query("SELECT 1 FROM sqlite_master WHERE type IN ('table','virtual table') AND name = ? LIMIT 1")
-				.get(table) !== null
-		);
-	} catch {
-		return false;
-	}
-}
-
 function rowValue<T>(row: unknown, key: string): T | undefined {
 	if (row && typeof row === "object" && key in row) return (row as Record<string, T>)[key];
 	return undefined;
@@ -102,12 +86,9 @@ export function normalizeWeights(
 	ftsWeight: number | null | undefined,
 	importanceWeight: number | null | undefined,
 ): HybridWeights {
-	let vw = Math.max(0, vecWeight ?? envNumber("MNEMOPI_VEC_WEIGHT", DEFAULT_WEIGHTS[0]));
-	let fw = Math.max(0, ftsWeight ?? envNumber("MNEMOPI_FTS_WEIGHT", DEFAULT_WEIGHTS[1]));
-	let iw = Math.max(0, importanceWeight ?? envNumber("MNEMOPI_IMPORTANCE_WEIGHT", DEFAULT_WEIGHTS[2]));
-	if (!Number.isFinite(vw)) vw = 0;
-	if (!Number.isFinite(fw)) fw = 0;
-	if (!Number.isFinite(iw)) iw = 0;
+	const vw = Math.max(0, vecWeight ?? envNumber("MNEMOPI_VEC_WEIGHT", DEFAULT_WEIGHTS[0]));
+	const fw = Math.max(0, ftsWeight ?? envNumber("MNEMOPI_FTS_WEIGHT", DEFAULT_WEIGHTS[1]));
+	const iw = Math.max(0, importanceWeight ?? envNumber("MNEMOPI_IMPORTANCE_WEIGHT", DEFAULT_WEIGHTS[2]));
 	const total = vw + fw + iw;
 	if (total === 0) return DEFAULT_WEIGHTS;
 	return [vw / total, fw / total, iw / total];
@@ -125,12 +106,8 @@ export function parseTimestampFast(
 	const cache = timestampCacheFor(beam);
 	const cached = cache.get(ts);
 	if (cached !== undefined) return cached;
-	let parsed: Date;
-	try {
-		parsed = parseIsoDateTimeUtc(ts);
-	} catch {
-		return null;
-	}
+	const parsed = new Date(ts);
+	if (Number.isNaN(parsed.getTime())) return null;
 	if (cache.size >= TS_CACHE_MAX) cache.clear();
 	cache.set(ts, parsed);
 	return parsed;
@@ -142,12 +119,10 @@ export function recencyDecay(
 	now: Date = new Date(),
 ): number {
 	if (!timestamp) return 0.5;
-	const halflife = asFiniteNonNegative(halflifeHours);
-	if (halflife === 0) return 0.5;
 	const ts = parseTimestampFast(timestamp);
 	if (ts === null) return 0.5;
 	const ageHours = (now.getTime() - ts.getTime()) / 3_600_000;
-	return Math.exp(-ageHours / halflife);
+	return Math.exp(-ageHours / halflifeHours);
 }
 
 export function temporalBoost(
@@ -160,10 +135,8 @@ export function temporalBoost(
 	if (ts === null) return 0;
 	const query = typeof queryTime === "string" ? parseIsoDateTimeUtc(queryTime) : normalizeDateTimeUtc(queryTime);
 	const effectiveTs = ts.getTime() > query.getTime() ? query : ts;
-	const halflife = asFiniteNonNegative(halflifeHours);
-	if (halflife === 0) return effectiveTs.getTime() === query.getTime() ? 1 : 0;
 	const hoursDelta = (query.getTime() - effectiveTs.getTime()) / 3_600_000;
-	return Math.exp(-hoursDelta / halflife);
+	return Math.exp(-hoursDelta / halflifeHours);
 }
 
 export function lexicalRelevance(queryTokens: readonly string[], content: string, queryLower = ""): number {
@@ -247,70 +220,58 @@ export function cjkLikeSearch(
 	const table = working ? "working_memory" : "episodic_memory";
 	const idColumn = working ? "id" : "rowid";
 	const conditions = cjkChars.map(() => "content LIKE ? ESCAPE '\\'").join(" OR ");
-	try {
-		const rows = db
-			.query(
-				`SELECT ${idColumn}, content FROM ${table} WHERE superseded_by IS NULL AND (valid_until IS NULL OR valid_until > ?)
-				   AND (${conditions}) LIMIT ?`,
-			)
-			.all(new Date().toISOString(), ...cjkChars.map(ch => `%${ch}%`), k * 5) as Record<string, unknown>[];
-		const scored: Array<{ id: string | number; score: number }> = [];
-		for (const row of rows) {
-			const content = String(row.content ?? "");
-			let hits = 0;
-			for (const ch of cjkChars) if (content.includes(ch)) hits += 1;
-			const score = hits / Math.max(cjkChars.length, 1);
-			if (score > 0) scored.push({ id: row[idColumn] as string | number, score });
-		}
-		scored.sort((a, b) => b.score - a.score);
-		return scored
-			.slice(0, Math.max(0, Math.trunc(k)))
-			.map(row =>
-				working ? { id: String(row.id), rank: -row.score } : { rowid: Number(row.id), rank: -row.score },
-			);
-	} catch {
-		return [];
+	const rows = db
+		.query(
+			`SELECT ${idColumn}, content FROM ${table} WHERE superseded_by IS NULL AND (valid_until IS NULL OR valid_until > ?)
+			   AND (${conditions}) LIMIT ?`,
+		)
+		.all(new Date().toISOString(), ...cjkChars.map(ch => `%${ch}%`), k * 5) as Record<string, unknown>[];
+	const scored: Array<{ id: string | number; score: number }> = [];
+	for (const row of rows) {
+		const content = String(row.content ?? "");
+		let hits = 0;
+		for (const ch of cjkChars) if (content.includes(ch)) hits += 1;
+		const score = hits / Math.max(cjkChars.length, 1);
+		if (score > 0) scored.push({ id: row[idColumn] as string | number, score });
 	}
+	scored.sort((a, b) => b.score - a.score);
+	return scored
+		.slice(0, Math.max(0, Math.trunc(k)))
+		.map(row =>
+			working ? { id: String(row.id), rank: -row.score } : { rowid: Number(row.id), rank: -row.score },
+		);
 }
 
 export function ftsSearch(db: Database, query: string, k = 20): FtsRankResult[] {
 	const ftsQuery = buildFtsQuery(query);
 	if (!ftsQuery) return hasCjk(query) ? (cjkLikeSearch(db, query, k, false) as FtsRankResult[]) : [];
-	try {
-		const rows = db
-			.query(
-				`SELECT f.rowid, f.rank FROM fts_episodes f
-				 WHERE f.fts_episodes MATCH ?
-				   AND EXISTS (SELECT 1 FROM episodic_memory e WHERE e.rowid = f.rowid AND e.superseded_by IS NULL
-			       AND (e.valid_until IS NULL OR e.valid_until > ?))
-				 ORDER BY f.rank, f.rowid LIMIT ?`,
-			)
-			.all(ftsQuery, new Date().toISOString(), k) as Record<string, unknown>[];
-		if (rows.length === 0 && hasCjk(query)) return cjkLikeSearch(db, query, k, false) as FtsRankResult[];
-		return rows.map(row => ({ rowid: Number(row.rowid), rank: Number(row.rank) }));
-	} catch {
-		return [];
-	}
+	const rows = db
+		.query(
+			`SELECT f.rowid, f.rank FROM fts_episodes f
+			 WHERE f.fts_episodes MATCH ?
+			   AND EXISTS (SELECT 1 FROM episodic_memory e WHERE e.rowid = f.rowid AND e.superseded_by IS NULL
+		       AND (e.valid_until IS NULL OR e.valid_until > ?))
+			 ORDER BY f.rank, f.rowid LIMIT ?`,
+		)
+		.all(ftsQuery, new Date().toISOString(), k) as Record<string, unknown>[];
+	if (rows.length === 0 && hasCjk(query)) return cjkLikeSearch(db, query, k, false) as FtsRankResult[];
+	return rows.map(row => ({ rowid: Number(row.rowid), rank: Number(row.rank) }));
 }
 
 export function ftsSearchWorking(db: Database, query: string, k = 20): WorkingFtsRankResult[] {
 	const ftsQuery = buildFtsQuery(query);
 	if (!ftsQuery) return hasCjk(query) ? (cjkLikeSearch(db, query, k, true) as WorkingFtsRankResult[]) : [];
-	try {
-		const rows = db
-			.query(
-				`SELECT f.id, f.rank FROM fts_working f
-				 WHERE f.fts_working MATCH ?
-				   AND EXISTS (SELECT 1 FROM working_memory w WHERE w.id = f.id AND w.superseded_by IS NULL
-				       AND (w.valid_until IS NULL OR w.valid_until > ?))
-				 ORDER BY f.rank, f.id LIMIT ?`,
-			)
-			.all(ftsQuery, new Date().toISOString(), k) as Record<string, unknown>[];
-		if (rows.length === 0 && hasCjk(query)) return cjkLikeSearch(db, query, k, true) as WorkingFtsRankResult[];
-		return rows.map(row => ({ id: String(row.id), rank: Number(row.rank) }));
-	} catch {
-		return [];
-	}
+	const rows = db
+		.query(
+			`SELECT f.id, f.rank FROM fts_working f
+			 WHERE f.fts_working MATCH ?
+			   AND EXISTS (SELECT 1 FROM working_memory w WHERE w.id = f.id AND w.superseded_by IS NULL
+			       AND (w.valid_until IS NULL OR w.valid_until > ?))
+			 ORDER BY f.rank, f.id LIMIT ?`,
+		)
+		.all(ftsQuery, new Date().toISOString(), k) as Record<string, unknown>[];
+	if (rows.length === 0 && hasCjk(query)) return cjkLikeSearch(db, query, k, true) as WorkingFtsRankResult[];
+	return rows.map(row => ({ id: String(row.id), rank: Number(row.rank) }));
 }
 
 export function encodeVector(embedding: readonly number[]): string {
@@ -319,38 +280,30 @@ export function encodeVector(embedding: readonly number[]): string {
 
 export function decodeVector(value: string | null | undefined): Vector | null {
 	if (!value) return null;
-	try {
-		const parsed = JSON.parse(value) as unknown;
-		if (!Array.isArray(parsed)) return null;
-		const vector: number[] = [];
-		for (const item of parsed) {
-			if (typeof item !== "number" || !Number.isFinite(item)) return null;
-			vector.push(item);
-		}
-		return vector;
-	} catch {
-		return null;
+	const parsed = JSON.parse(value) as unknown;
+	if (!Array.isArray(parsed)) return null;
+	const vector: number[] = [];
+	for (const item of parsed) {
+		if (typeof item !== "number" || !Number.isFinite(item)) return null;
+		vector.push(item);
 	}
+	return vector;
 }
 
 export function inMemoryVecSearch(db: Database, queryEmbedding: readonly number[], k = 20): VectorDistanceResult[] {
 	if (queryEmbedding.length === 0) return [];
-	try {
-		const rows = db
-			.query(`
-				SELECT em.rowid, me.memory_id, me.embedding_json
-				FROM memory_embeddings me
-				JOIN episodic_memory em ON me.memory_id = em.id
-				LIMIT 10000
-			`)
-			.all() as Record<string, unknown>[];
-		const index = buildExactVectorIndex(
-			rows.map(row => ({ id: Number(row.rowid), vector: decodeVector(String(row.embedding_json ?? "")) })),
-		);
-		return searchExactVectorIndex(index, queryEmbedding, k).map(hit => ({ rowid: hit.id, distance: 1 - hit.score }));
-	} catch {
-		return [];
-	}
+	const rows = db
+		.query(`
+			SELECT em.rowid, me.memory_id, me.embedding_json
+			FROM memory_embeddings me
+			JOIN episodic_memory em ON me.memory_id = em.id
+			LIMIT 10000
+		`)
+		.all() as Record<string, unknown>[];
+	const index = buildExactVectorIndex(
+		rows.map(row => ({ id: Number(row.rowid), vector: decodeVector(String(row.embedding_json ?? "")) })),
+	);
+	return searchExactVectorIndex(index, queryEmbedding, k).map(hit => ({ rowid: hit.id, distance: 1 - hit.score }));
 }
 
 export function workingMemoryVecSearch(
@@ -360,34 +313,26 @@ export function workingMemoryVecSearch(
 	now: Date = new Date(),
 ): WorkingVectorResult[] {
 	if (queryEmbedding.length === 0) return [];
-	try {
-		const rows = db
-			.query(`
-				SELECT wm.id, me.embedding_json
-				FROM memory_embeddings me
-				JOIN working_memory wm ON me.memory_id = wm.id
-				WHERE wm.superseded_by IS NULL
-				  AND (wm.valid_until IS NULL OR wm.valid_until > ?)
-				LIMIT 50000
-			`)
-			.all(now.toISOString()) as Record<string, unknown>[];
-		const index = buildExactVectorIndex(
-			rows.map(row => ({ id: String(row.id), vector: decodeVector(String(row.embedding_json ?? "")) })),
-		);
-		return searchExactVectorIndex(index, queryEmbedding, k).map(hit => ({ id: hit.id, sim: hit.score }));
-	} catch {
-		return [];
-	}
+	const rows = db
+		.query(`
+			SELECT wm.id, me.embedding_json
+			FROM memory_embeddings me
+			JOIN working_memory wm ON me.memory_id = wm.id
+			WHERE wm.superseded_by IS NULL
+			  AND (wm.valid_until IS NULL OR wm.valid_until > ?)
+			LIMIT 50000
+		`)
+		.all(now.toISOString()) as Record<string, unknown>[];
+	const index = buildExactVectorIndex(
+		rows.map(row => ({ id: String(row.id), vector: decodeVector(String(row.embedding_json ?? "")) })),
+	);
+	return searchExactVectorIndex(index, queryEmbedding, k).map(hit => ({ id: hit.id, sim: hit.score }));
 }
 
 export function normalizeMetadata(input: unknown): Metadata {
 	if (input == null) return {};
 	if (typeof input === "string") {
-		try {
-			return normalizeMetadata(JSON.parse(input) as unknown);
-		} catch {
-			return {};
-		}
+		return normalizeMetadata(JSON.parse(input) as unknown);
 	}
 	if (typeof input !== "object" || Array.isArray(input)) return {};
 	const out: Metadata = {};

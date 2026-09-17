@@ -8,11 +8,14 @@ import { EpisodicGraph } from "../episodic-graph";
  */
 import type { SQLQueryBindings } from "bun:sqlite";
 import { transaction } from "../../db";
+import { nowIso } from "../../util/datetime";
+import { placeholders } from "../../util/sql";
 import { generateId } from "../../util/ids";
 import { scratchpadMaxItems } from "../../config";
-import { metadataJson, normalizeMetadata } from "./helpers";
+import { emitEvent, type EventPayload } from "./events";
+import { metadataJson } from "./helpers";
+import { scopeFilterClauses } from "./row";
 import type {
-	BeamEvent,
 	BeamMemoryState,
 	BeamStats,
 	ImportStats,
@@ -25,8 +28,6 @@ import type {
 } from "./types";
 
 type Row = Record<string, unknown>;
-type EventPayload = Omit<BeamEvent, "type" | "sessionId" | "timestamp">;
-
 type StoreRememberOptions = RememberOptions;
 
 const CANONICAL_VERACITY: Record<string, true> = {
@@ -48,10 +49,6 @@ const TRUST_TIERS: Record<string, true> = {
 
 /** Tables whose rows point back to a `working_memory` id via `source_memory_id`. */
 const MEMORIA_SOURCE_TABLES = ["memoria_facts"] as const;
-
-function toUtcIso(date: Date = new Date()): string {
-	return date.toISOString();
-}
 
 function clampVeracity(value: unknown): Veracity {
 	if (typeof value !== "string") return "unknown";
@@ -84,33 +81,11 @@ function normalizeTrustTier(value: unknown, source: string): TrustTier {
 	return "STATED";
 }
 
-function emitEvent(beam: BeamMemoryState, type: string, data: EventPayload): void {
-	const event: BeamEvent = {
-		...data,
-		type,
-		sessionId: beam.sessionId,
-		timestamp: toUtcIso(),
-	};
-	beam.eventEmitter?.(event);
-	void beam.pluginManager?.emit?.(event);
-}
-
 function findDuplicate(beam: BeamMemoryState, content: string): string | null {
 	const row = beam.db
 		.query("SELECT id FROM working_memory WHERE content = ? AND session_id = ? LIMIT 1")
 		.get(content, beam.sessionId) as { id: string } | null;
 	return row?.id ?? null;
-}
-
-function tableExists(db: BeamMemoryState["db"], table: string): boolean {
-	try {
-		return (
-			db.query("SELECT 1 FROM sqlite_master WHERE type IN ('table','virtual table') AND name = ? LIMIT 1").get(table) !==
-			null
-		);
-	} catch {
-		return false;
-	}
 }
 
 function embeddingText(content: string, options: { embedText?: string }): string {
@@ -149,46 +124,34 @@ function sqlBinding(value: unknown, fallback: SQLQueryBindings): SQLQueryBinding
  */
 function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly string[]): void {
 	if (ids.length === 0) return;
-	const placeholders = ids.map(() => "?").join(", ");
+	const idPlaceholders = placeholders(ids.length);
 
 	const graphRefs = new Set<string>(ids);
 	for (const id of ids) graphRefs.add(`gist_${id}`);
-	if (tableExists(db, "facts")) {
-		const factRows = db.prepare(`SELECT fact_id FROM facts WHERE source_msg_id IN (${placeholders})`).all(...ids) as {
-			fact_id: string;
-		}[];
-		for (const row of factRows) graphRefs.add(row.fact_id);
-		db.run(`DELETE FROM facts WHERE source_msg_id IN (${placeholders})`, [...ids]);
-	}
+	const factRows = db.prepare(`SELECT fact_id FROM facts WHERE source_msg_id IN (${idPlaceholders})`).all(...ids) as {
+		fact_id: string;
+	}[];
+	for (const row of factRows) graphRefs.add(row.fact_id);
+	db.run(`DELETE FROM facts WHERE source_msg_id IN (${idPlaceholders})`, [...ids]);
 
-	db.run(`DELETE FROM annotations WHERE memory_id IN (${placeholders})`, [...ids]);
-	db.run(`DELETE FROM memory_embeddings WHERE memory_id IN (${placeholders})`, [...ids]);
+	db.run(`DELETE FROM annotations WHERE memory_id IN (${idPlaceholders})`, [...ids]);
+	db.run(`DELETE FROM memory_embeddings WHERE memory_id IN (${idPlaceholders})`, [...ids]);
 	for (const table of MEMORIA_SOURCE_TABLES) {
-		if (tableExists(db, table)) {
-			db.run(`DELETE FROM ${table} WHERE source_memory_id IN (${placeholders})`, [...ids]);
-		}
+		db.run(`DELETE FROM ${table} WHERE source_memory_id IN (${idPlaceholders})`, [...ids]);
 	}
 
-	if (tableExists(db, "gists")) {
-		db.run(`DELETE FROM gists WHERE memory_id IN (${placeholders})`, [...ids]);
-	}
-	if (tableExists(db, "graph_edges")) {
-		const refs = [...graphRefs];
-		const refPlaceholders = refs.map(() => "?").join(", ");
-		db.run(`DELETE FROM graph_edges WHERE source IN (${refPlaceholders}) OR target IN (${refPlaceholders})`, [
-			...refs,
-			...refs,
-		]);
-	}
+	db.run(`DELETE FROM gists WHERE memory_id IN (${idPlaceholders})`, [...ids]);
+	const refs = [...graphRefs];
+	const refPlaceholders = refs.map(() => "?").join(", ");
+	db.run(`DELETE FROM graph_edges WHERE source IN (${refPlaceholders}) OR target IN (${refPlaceholders})`, [
+		...refs,
+		...refs,
+	]);
 }
 function addTemporalAnnotations(beam: BeamMemoryState, memoryId: string, timestamp: string, source: string): void {
-	try {
-		beam.annotations?.add?.(memoryId, "occurred_on", timestamp.slice(0, 10));
-		if (source && source !== "conversation" && source !== "user" && source !== "assistant") {
-			beam.annotations?.add?.(memoryId, "has_source", source);
-		}
-	} catch {
-		// Annotation enrichment is best-effort, matching Python's non-blocking path.
+	beam.annotations?.add?.(memoryId, "occurred_on", timestamp.slice(0, 10));
+	if (source && source !== "conversation" && source !== "user" && source !== "assistant") {
+		beam.annotations?.add?.(memoryId, "has_source", source);
 	}
 }
 
@@ -204,19 +167,15 @@ function proactiveLinkIfEnabled(
 	extractEntities: boolean,
 ): void {
 	if (!proactiveLinkingAllowed(beam)) return;
-	try {
-		const graph =
-			beam.episodicGraph instanceof EpisodicGraph
-				? beam.episodicGraph
-				: new EpisodicGraph({ db: beam.db, dbPath: beam.dbPath });
-		graph.ingestMemory(content, memoryId, {
-			sessionId: beam.sessionId,
-			linkExisting: true,
-			extractEntities,
-		});
-	} catch {
-		// Proactive graph enrichment must never block durable memory storage.
-	}
+	const graph =
+		beam.episodicGraph instanceof EpisodicGraph
+			? beam.episodicGraph
+			: new EpisodicGraph({ db: beam.db, dbPath: beam.dbPath });
+	graph.ingestMemory(content, memoryId, {
+		sessionId: beam.sessionId,
+		linkExisting: true,
+		extractEntities,
+	});
 }
 
 /**
@@ -228,7 +187,7 @@ function trimWorkingMemory(beam: BeamMemoryState): void {
 	const limit = beam.config.workingMemoryLimit;
 	if (!Number.isFinite(limit) || limit <= 0) return;
 	const ttlHours = beam.config.workingMemoryTtlHours;
-	const cutoff = toUtcIso(new Date(Date.now() - ttlHours * 3_600_000));
+	const cutoff = new Date(Date.now() - ttlHours * 3_600_000).toISOString();
 	transaction(beam.db, () => {
 		const ids = (
 			beam.db
@@ -252,8 +211,8 @@ function trimWorkingMemory(beam: BeamMemoryState): void {
 				.all(beam.sessionId, cutoff, beam.sessionId, limit) as { id: string }[]
 		).map(row => row.id);
 		if (ids.length === 0) return;
-		const placeholders = ids.map(() => "?").join(", ");
-		beam.db.run(`DELETE FROM working_memory WHERE id IN (${placeholders}) AND session_id = ?`, [
+		const idPlaceholders = placeholders(ids.length);
+		beam.db.run(`DELETE FROM working_memory WHERE id IN (${idPlaceholders}) AND session_id = ?`, [
 			...ids,
 			beam.sessionId,
 		]);
@@ -265,67 +224,87 @@ function rowToDict(row: Row): Row {
 	return { ...row };
 }
 
-export function remember(beam: BeamMemoryState, content: string, options: StoreRememberOptions = {}): string {
-	const source = options.source ?? "conversation";
-	const importance = options.importance ?? 0.5;
-	const timestamp = options.timestamp ?? toUtcIso();
-	const scope = options.scope ?? "session";
-	const veracity = clampVeracity(options.veracity);
-	const trustTier = normalizeTrustTier(options.trustTier, source);
-	const memoryType = options.memoryType ?? "unknown";
-	const authorId = options.authorId ?? beam.authorId;
-	const authorType = options.authorType ?? beam.authorType;
-	const channelId = options.channelId ?? beam.channelId;
-	const metadata = options.metadata ?? null;
-	const embedText = embeddingText(content, options);
+/** Refresh an exact-content duplicate: importance ratchets up, freshness resets. */
+function updateDuplicateMemory(
+	beam: BeamMemoryState,
+	existingId: string,
+	fields: {
+		content: string;
+		source: string;
+		importance: number;
+		timestamp: string;
+		scope: string;
+		veracity: Veracity;
+		trustTier: TrustTier;
+		memoryType: string;
+		validUntil: string | null;
+		embedText: string | null;
+		metadata: Metadata | null;
+	},
+): string {
+	beam.db.run(
+		`
+			UPDATE working_memory
+			SET importance = MAX(importance, ?), timestamp = ?, source = ?,
+				valid_until = COALESCE(?, valid_until),
+				scope = COALESCE(?, scope),
+				author_id = COALESCE(?, author_id),
+				author_type = COALESCE(?, author_type),
+				channel_id = COALESCE(?, channel_id),
+				memory_type = COALESCE(?, memory_type),
+				veracity = CASE WHEN ? != 'unknown' THEN ? ELSE veracity END,
+				trust_tier = COALESCE(?, trust_tier),
+				embed_text = COALESCE(?, embed_text),
+				consolidated_at = NULL
+			WHERE id = ? AND session_id = ?
+		`,
+		[
+			fields.importance,
+			fields.timestamp,
+			fields.source,
+			fields.validUntil,
+			fields.scope,
+			beam.authorId,
+			beam.authorType,
+			beam.channelId,
+			fields.memoryType,
+			fields.veracity,
+			fields.veracity,
+			fields.trustTier,
+			fields.embedText,
+			existingId,
+			beam.sessionId,
+		],
+	);
+	emitEvent(beam, "MEMORY_UPDATED", {
+		memoryId: existingId,
+		content: fields.content,
+		source: fields.source,
+		importance: fields.importance,
+		metadata: fields.metadata ?? undefined,
+	});
+	return existingId;
+}
 
-	const existingId = findDuplicate(beam, content);
-	if (existingId !== null) {
-		beam.db.run(
-			`
-				UPDATE working_memory
-				SET importance = MAX(importance, ?), timestamp = ?, source = ?,
-					valid_until = COALESCE(?, valid_until),
-					scope = COALESCE(?, scope),
-					author_id = COALESCE(?, author_id),
-					author_type = COALESCE(?, author_type),
-					channel_id = COALESCE(?, channel_id),
-					memory_type = COALESCE(?, memory_type),
-					veracity = CASE WHEN ? != 'unknown' THEN ? ELSE veracity END,
-					trust_tier = COALESCE(?, trust_tier),
-					embed_text = COALESCE(?, embed_text),
-					consolidated_at = NULL
-				WHERE id = ? AND session_id = ?
-			`,
-			[
-				importance,
-				timestamp,
-				source,
-				options.validUntil ?? null,
-				scope,
-				authorId,
-				authorType,
-				channelId,
-				memoryType,
-				veracity,
-				veracity,
-				trustTier,
-				storedEmbeddingText(content, embedText),
-				existingId,
-				beam.sessionId,
-			],
-		);
-		emitEvent(beam, "MEMORY_UPDATED", {
-			memoryId: existingId,
-			content,
-			source,
-			importance,
-			metadata: metadata ?? undefined,
-		});
-		return existingId;
-	}
-
-	const memoryId = generateId(content, new Date(timestamp));
+/** Insert a fresh working-memory row, then run trim + enrichment. */
+function insertWorkingMemory(
+	beam: BeamMemoryState,
+	content: string,
+	fields: {
+		source: string;
+		importance: number;
+		timestamp: string;
+		scope: string;
+		veracity: Veracity;
+		trustTier: TrustTier;
+		memoryType: string;
+		validUntil: string | null;
+		embedText: string | null;
+		metadata: Metadata | null;
+		extractEntities: boolean;
+	},
+): string {
+	const memoryId = generateId(content, new Date(fields.timestamp));
 	beam.db.run(
 		`
 			INSERT INTO working_memory
@@ -336,33 +315,56 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 		[
 			memoryId,
 			content,
-			storedEmbeddingText(content, embedText),
-			source,
-			timestamp,
+			fields.embedText,
+			fields.source,
+			fields.timestamp,
 			beam.sessionId,
-			importance,
-			metadataJson(metadata),
-			options.validUntil ?? null,
-			scope,
-			authorId,
-			authorType,
-			channelId,
-			veracity,
-			memoryType,
-			trustTier,
+			fields.importance,
+			metadataJson(fields.metadata),
+			fields.validUntil,
+			fields.scope,
+			beam.authorId,
+			beam.authorType,
+			beam.channelId,
+			fields.veracity,
+			fields.memoryType,
+			fields.trustTier,
 		],
 	);
-	addTemporalAnnotations(beam, memoryId, timestamp, source);
-	proactiveLinkIfEnabled(beam, memoryId, content, options.extractEntities === true);
+	addTemporalAnnotations(beam, memoryId, fields.timestamp, fields.source);
+	proactiveLinkIfEnabled(beam, memoryId, content, fields.extractEntities);
 	trimWorkingMemory(beam);
 	emitEvent(beam, "MEMORY_ADDED", {
 		memoryId,
 		content,
-		source,
-		importance,
-		metadata: metadata ?? undefined,
+		source: fields.source,
+		importance: fields.importance,
+		metadata: fields.metadata ?? undefined,
 	});
 	return memoryId;
+}
+
+export function remember(beam: BeamMemoryState, content: string, options: StoreRememberOptions = {}): string {
+	const fields = {
+		content,
+		source: options.source ?? "conversation",
+		importance: options.importance ?? 0.5,
+		timestamp: options.timestamp ?? nowIso(),
+		scope: options.scope ?? "session",
+		veracity: clampVeracity(options.veracity),
+		trustTier: normalizeTrustTier(options.trustTier, options.source ?? "conversation"),
+		memoryType: options.memoryType ?? "unknown",
+		validUntil: options.validUntil ?? null,
+		embedText: storedEmbeddingText(content, embeddingText(content, options)),
+		metadata: options.metadata ?? null,
+		extractEntities: options.extractEntities === true,
+	};
+
+	const existingId = findDuplicate(beam, content);
+	if (existingId !== null) {
+		return updateDuplicateMemory(beam, existingId, fields);
+	}
+	return insertWorkingMemory(beam, content, fields);
 }
 
 export function rememberBatch(
@@ -370,7 +372,7 @@ export function rememberBatch(
 	items: readonly RememberBatchItem[],
 	options: RememberBatchOptions = {},
 ): string[] {
-	const timestamp = toUtcIso();
+	const timestamp = nowIso();
 	const ids: string[] = [];
 	const defaultVeracity = clampVeracity(options.veracity);
 	const defaultScope = options.scope ?? "session";
@@ -420,7 +422,7 @@ export function rememberBatch(
 }
 
 export function getContext(beam: BeamMemoryState, limit = 10): Row[] {
-	const now = toUtcIso();
+	const now = nowIso();
 	const rows = beam.db
 		.prepare(
 			`
@@ -441,7 +443,7 @@ export function getContext(beam: BeamMemoryState, limit = 10): Row[] {
 }
 
 export function invalidate(beam: BeamMemoryState, memoryId: string, replacementId: string | null = null): boolean {
-	const now = toUtcIso();
+	const now = nowIso();
 	const working = beam.db.run(
 		`
 			UPDATE working_memory
@@ -468,20 +470,7 @@ export function getWorkingStats(
 	authorType: string | null = null,
 	channelId: string | null = null,
 ): BeamStats {
-	const clauses: string[] = [];
-	const params: SQLQueryBindings[] = [];
-	if (authorId) {
-		clauses.push("author_id = ?");
-		params.push(authorId);
-	}
-	if (authorType) {
-		clauses.push("author_type = ?");
-		params.push(authorType);
-	}
-	if (channelId) {
-		clauses.push("channel_id = ?");
-		params.push(channelId);
-	}
+	const { clauses, params } = scopeFilterClauses(authorId, authorType, channelId);
 	const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
 	const totalRow = beam.db.prepare(`SELECT COUNT(*) AS total FROM working_memory${where}`).get(...params) as {
 		total: number;
@@ -594,7 +583,7 @@ export function forgetWorking(beam: BeamMemoryState, memoryId: string): boolean 
 
 export function scratchpadWrite(beam: BeamMemoryState, content: string): string {
 	const padId = generateId(content);
-	const timestamp = toUtcIso();
+	const timestamp = nowIso();
 	beam.db.run(
 		`
 			INSERT INTO scratchpad (id, content, session_id, created_at, updated_at)
@@ -660,7 +649,7 @@ export function exportToDict(beam: BeamMemoryState): Record<string, unknown> {
 	return {
 		mnemopi_export: {
 			version: "1.0",
-			export_date: toUtcIso(),
+			export_date: nowIso(),
 			source_db: beam.dbPath ?? ":memory:",
 			component: "beam",
 		},
@@ -683,7 +672,7 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 	// Imported working-memory rows are durable, not scratch: stamp any that
 	// arrive unconsolidated so the TTL trim never discards a restored bank
 	// (issue #4819).
-	const importedAt = toUtcIso();
+	const importedAt = nowIso();
 
 	transaction(db, () => {
 		for (const raw of Array.isArray(data.working_memory) ? data.working_memory : []) {
@@ -835,5 +824,3 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 	return stats;
 }
 
-// Re-exported for callers that need the normalized metadata of a stored row.
-export { normalizeMetadata };

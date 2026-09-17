@@ -8,13 +8,15 @@
  * MEMORIA retrieval (memoriaRetrieve), health(), extraction helpers.
  */
 import type { SQLQueryBindings } from "bun:sqlite";
+import { nowIso } from "../../util/datetime";
+import { emitEvent } from "./events";
 import { generateId } from "../../util/ids";
+import { placeholders } from "../../util/sql";
 import { aaakEncode } from "../aaak";
 import { EpisodicGraph } from "../episodic-graph";
 import { clampVeracity } from "../veracity-consolidation";
+import { asRows, rowValue, scopeFilterClauses, type Row } from "./row";
 import type { BeamMemoryState, BeamStats, JsonValue, Metadata, SleepResult } from "./types";
-
-type Row = Record<string, unknown>;
 
 type ConsolidateOptions = {
 	metadata?: Metadata | null;
@@ -118,17 +120,8 @@ function buildSleepSummary(beam: BeamMemoryState, source: string, chunk: SleepCh
 	};
 }
 
-function isoNow(): string {
-	return new Date().toISOString();
-}
-
 function cutoffIso(amount: number, unitMs: number): string {
 	return new Date(Date.now() - amount * unitMs).toISOString();
-}
-
-function rowValue(row: Row, key: string): string | null {
-	const value = row[key];
-	return value == null ? null : String(value);
 }
 
 function isEpisodicVeracity(value: string): value is EpisodicVeracity {
@@ -172,48 +165,18 @@ function sourceSession(beam: BeamMemoryState): string {
 	return beam.sessionId || "default";
 }
 
-function asRows(value: unknown): Row[] {
-	return Array.isArray(value) ? (value as Row[]) : [];
-}
-
-function emitEvent(
-	beam: BeamMemoryState,
-	type: string,
-	memoryId: string,
-	content: string,
-	source: string,
-	importance: number,
-	metadata: Metadata,
-): void {
-	const event = {
-		type,
-		sessionId: beam.sessionId,
-		timestamp: isoNow(),
-		memoryId,
-		content,
-		source,
-		importance,
-		metadata,
-	};
-	beam.eventEmitter?.(event);
-	void beam.pluginManager?.emit?.(event);
-}
-
 /**
  * Populate the episodic graph (gist + ctx edge + lexical links) for a freshly
  * consolidated memory. Best-effort: failures never roll back the consolidation.
  */
 function ingestIntoEpisodicGraph(beam: BeamMemoryState, memoryId: string, summary: string): void {
-	try {
-		const graph = beam.episodicGraph instanceof EpisodicGraph ? beam.episodicGraph : new EpisodicGraph({ db: beam.db, dbPath: beam.dbPath });
-		graph.ingestMemory(summary, memoryId, {
-			sessionId: sourceSession(beam),
-			linkExisting: true,
-			extractEntities: false,
-		});
-	} catch {
-		// Graph enrichment is best-effort and never blocks consolidation.
-	}
+	const graph =
+		beam.episodicGraph instanceof EpisodicGraph ? beam.episodicGraph : new EpisodicGraph({ db: beam.db, dbPath: beam.dbPath });
+	graph.ingestMemory(summary, memoryId, {
+		sessionId: sourceSession(beam),
+		linkExisting: true,
+		extractEntities: false,
+	});
 }
 
 export function consolidateToEpisodic(
@@ -225,7 +188,7 @@ export function consolidateToEpisodic(
 	options: ConsolidateOptions = {},
 ): string {
 	const memoryId = generateId(summary);
-	const timestamp = isoNow();
+	const timestamp = nowIso();
 	const scope = options.scope ?? "session";
 	const veracity = clampEpisodicVeracity(options.veracity ?? "unknown");
 	const metadata = options.metadata ?? {};
@@ -254,9 +217,12 @@ export function consolidateToEpisodic(
 		],
 	);
 	ingestIntoEpisodicGraph(beam, memoryId, summary);
-	emitEvent(beam, "MEMORY_CONSOLIDATED", memoryId, summary, source, importance, {
-		summary_of: [...sourceWmIds],
-		...metadata,
+	emitEvent(beam, "MEMORY_CONSOLIDATED", {
+		memoryId,
+		content: summary,
+		source,
+		importance,
+		metadata: { summary_of: [...sourceWmIds], ...metadata },
 	});
 	return memoryId;
 }
@@ -267,20 +233,7 @@ export function getEpisodicStats(
 	authorType: string | null = null,
 	channelId: string | null = null,
 ): BeamStats {
-	const clauses: string[] = [];
-	const params: SQLQueryBindings[] = [];
-	if (authorId) {
-		clauses.push("author_id = ?");
-		params.push(authorId);
-	}
-	if (authorType) {
-		clauses.push("author_type = ?");
-		params.push(authorType);
-	}
-	if (channelId) {
-		clauses.push("channel_id = ?");
-		params.push(channelId);
-	}
+	const { clauses, params } = scopeFilterClauses(authorId, authorType, channelId);
 	const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
 	const totalRow = beam.db.query(`SELECT COUNT(*) AS count FROM episodic_memory${where}`).get(...params) as {
 		count: number;
@@ -320,7 +273,7 @@ function invalidateEpisodicVectors(beam: BeamMemoryState, memoryId: string): voi
 }
 
 export function degradeEpisodic(beam: BeamMemoryState, dryRun = false): Record<string, JsonValue> {
-	const now = isoNow();
+	const now = nowIso();
 	const tier2Cutoff = cutoffIso(TIER2_DAYS, 24 * 60 * 60 * 1000);
 	const tier3Cutoff = cutoffIso(TIER3_DAYS, 24 * 60 * 60 * 1000);
 	const tier1Rows = asRows(
@@ -348,40 +301,24 @@ export function degradeEpisodic(beam: BeamMemoryState, dryRun = false): Record<s
 		const content = rowValue(row, "content") ?? "";
 		if (!id) continue;
 		const compressed = content.slice(0, 800);
-		beam.db.run("SAVEPOINT degrade_episodic");
-		try {
-			beam.db.run("UPDATE episodic_memory SET content = ?, tier = 2, degraded_at = ? WHERE id = ?", [
-				compressed,
-				now,
-				id,
-			]);
-			if (compressed !== content) invalidateEpisodicVectors(beam, id);
-			beam.db.run("RELEASE degrade_episodic");
-		} catch {
-			beam.db.run("ROLLBACK TO degrade_episodic");
-			beam.db.run("RELEASE degrade_episodic");
-			result.tier1_to_tier2--;
-		}
+		beam.db.run("UPDATE episodic_memory SET content = ?, tier = 2, degraded_at = ? WHERE id = ?", [
+			compressed,
+			now,
+			id,
+		]);
+		if (compressed !== content) invalidateEpisodicVectors(beam, id);
 	}
 	for (const row of tier2Rows) {
 		const id = rowValue(row, "id");
 		const content = rowValue(row, "content") ?? "";
 		if (!id) continue;
 		const compressed = content.length > TIER3_MAX_CHARS ? extractKeySignal(content, TIER3_MAX_CHARS) : content;
-		beam.db.run("SAVEPOINT degrade_episodic");
-		try {
-			beam.db.run("UPDATE episodic_memory SET content = ?, tier = 3, degraded_at = ? WHERE id = ?", [
-				compressed,
-				now,
-				id,
-			]);
-			if (compressed !== content) invalidateEpisodicVectors(beam, id);
-			beam.db.run("RELEASE degrade_episodic");
-		} catch {
-			beam.db.run("ROLLBACK TO degrade_episodic");
-			beam.db.run("RELEASE degrade_episodic");
-			result.tier2_to_tier3--;
-		}
+		beam.db.run("UPDATE episodic_memory SET content = ?, tier = 3, degraded_at = ? WHERE id = ?", [
+			compressed,
+			now,
+			id,
+		]);
+		if (compressed !== content) invalidateEpisodicVectors(beam, id);
 	}
 	return result;
 }
@@ -415,34 +352,18 @@ function eligibleWorkingRows(beam: BeamMemoryState, sessionId: string): Row[] {
 	);
 }
 
-export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
-	let rows = eligibleWorkingRows(beam, sourceSession(beam));
-	if (rows.length === 0)
-		return { dry_run: dryRun, status: "no_op", message: "No old working memories to consolidate" };
-	if (!dryRun) {
-		const claimTs = isoNow();
-		const ids = rows.map(row => rowValue(row, "id")).filter((id): id is string => id !== null);
-		const placeholders = ids.map(() => "?").join(",");
-		beam.db.run(
-			`UPDATE working_memory SET consolidated_at = ? WHERE id IN (${placeholders}) AND consolidated_at IS NULL`,
-			[claimTs, ...ids],
-		);
-		const claimed = new Set(
-			asRows(
-				beam.db
-					.query(`SELECT id FROM working_memory WHERE id IN (${placeholders}) AND consolidated_at = ?`)
-					.all(...ids, claimTs),
-			).map(row => rowValue(row, "id")),
-		);
-		if (claimed.size === 0)
-			return {
-				dry_run: false,
-				status: "no_op",
-				message: "All eligible rows claimed by concurrent sleep",
-			};
-		rows = rows.filter(row => claimed.has(rowValue(row, "id")));
-	}
+/** Stamp `consolidated_at` on the eligible rows so a concurrent sleep cannot double-claim. */
+function claimWorkingRows(beam: BeamMemoryState, rows: readonly Row[]): void {
+	const ids = rows.map(row => rowValue(row, "id")).filter((id): id is string => id !== null);
+	if (ids.length === 0) return;
+	beam.db.run(
+		`UPDATE working_memory SET consolidated_at = ? WHERE id IN (${placeholders(ids.length)}) AND consolidated_at IS NULL`,
+		[nowIso(), ...ids],
+	);
+}
 
+/** Group eligible rows by their `source` so each group becomes its own episode. */
+function groupRowsBySource(rows: readonly Row[]): Map<string, Row[]> {
 	const grouped = new Map<string, Row[]>();
 	for (const row of rows) {
 		const source = rowValue(row, "source") ?? "unknown";
@@ -450,51 +371,71 @@ export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
 		if (group) group.push(row);
 		else grouped.set(source, [row]);
 	}
+	return grouped;
+}
+
+/** Compress one chunk of same-source rows into a single episodic summary. */
+function consolidateSleepChunk(
+	beam: BeamMemoryState,
+	source: string,
+	chunk: SleepChunk,
+	dryRun: boolean,
+): string[] {
+	const ids = chunk.items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
+	let scope = "session";
+	let validUntil: string | null = null;
+	for (const item of chunk.items) {
+		if (rowValue(item, "scope") === "global") scope = "global";
+		const itemValidUntil = rowValue(item, "valid_until");
+		if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
+	}
+
+	const sleepSummary = buildSleepSummary(beam, source, chunk);
+	const metadata: Metadata = { original_count: chunk.items.length, source, llm_used: false };
+	if (sleepSummary.truncated) {
+		metadata.truncated = true;
+		metadata.original_chars = sleepSummary.originalChars;
+		metadata.max_chars = sleepSummary.maxChars;
+	}
+
+	if (!dryRun) {
+		consolidateToEpisodic(beam, sleepSummary.summary, ids, "sleep_consolidation", 0.6, {
+			scope,
+			validUntil,
+			veracity: aggregateEpisodicVeracity(chunk.items.map(item => rowValue(item, "veracity") ?? "unknown")),
+			metadata,
+		});
+	}
+	return ids;
+}
+
+function logSleepSummary(beam: BeamMemoryState, itemsConsolidated: number, summariesCreated: number): void {
+	beam.db.run(
+		`INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at) VALUES (?, ?, ?, ?)`,
+		[sourceSession(beam), itemsConsolidated, `${summariesCreated} summaries (aaak) from ${itemsConsolidated} items`, nowIso()],
+	);
+}
+
+export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
+	const rows = eligibleWorkingRows(beam, sourceSession(beam));
+	if (rows.length === 0) {
+		return { dry_run: dryRun, status: "no_op", message: "No old working memories to consolidate" };
+	}
+
+	if (!dryRun) claimWorkingRows(beam, rows);
 
 	const consolidatedIds: string[] = [];
 	let summariesCreated = 0;
-	for (const [source, items] of grouped) {
+	for (const [source, items] of groupRowsBySource(rows)) {
 		for (const chunk of splitSleepItems(beam, source, items)) {
-			const ids = chunk.items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
-			let scope = "session";
-			let validUntil: string | null = null;
-			for (const item of chunk.items) {
-				if (rowValue(item, "scope") === "global") scope = "global";
-				const itemValidUntil = rowValue(item, "valid_until");
-				if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
-			}
-			const sleepSummary = buildSleepSummary(beam, source, chunk);
-			const metadata: Metadata = { original_count: chunk.items.length, source, llm_used: false };
-			if (sleepSummary.truncated) {
-				metadata.truncated = true;
-				metadata.original_chars = sleepSummary.originalChars;
-				metadata.max_chars = sleepSummary.maxChars;
-			}
-			const summary = sleepSummary.summary;
-			if (!dryRun) {
-				consolidateToEpisodic(beam, summary, ids, "sleep_consolidation", 0.6, {
-					scope,
-					validUntil,
-					veracity: aggregateEpisodicVeracity(chunk.items.map(item => rowValue(item, "veracity") ?? "unknown")),
-					metadata,
-				});
-			}
-			consolidatedIds.push(...ids);
+			consolidatedIds.push(...consolidateSleepChunk(beam, source, chunk, dryRun));
 			summariesCreated++;
 		}
 	}
-	if (!dryRun) {
-		beam.db.run(
-			`INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at) VALUES (?, ?, ?, ?)`,
-			[
-				sourceSession(beam),
-				consolidatedIds.length,
-				`${summariesCreated} summaries (aaak) from ${consolidatedIds.length} items`,
-				isoNow(),
-			],
-		);
-	}
+
+	if (!dryRun) logSleepSummary(beam, consolidatedIds.length, summariesCreated);
 	const degradation = degradeEpisodic(beam, dryRun);
+
 	return {
 		dry_run: dryRun,
 		status: dryRun ? "dry_run" : "consolidated",

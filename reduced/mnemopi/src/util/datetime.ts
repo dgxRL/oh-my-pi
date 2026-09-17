@@ -24,3 +24,8 @@ export function parseQueryTime(value: QueryTime): Date {
 	if (value === null || value === undefined) return new Date();
 	return typeof value === "string" ? parseIsoDateTimeUtc(value) : normalizeDateTimeUtc(value);
 }
+
+/** Current UTC time as an ISO string — the canonical "now" for stored rows. */
+export function nowIso(): string {
+	return new Date().toISOString();
+}

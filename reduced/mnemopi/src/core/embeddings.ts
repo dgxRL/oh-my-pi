@@ -12,7 +12,6 @@ import { join } from "node:path";
 import {
 	type EmbeddingOutput,
 	getMnemopiRuntimeOptions,
-	mnemopiDebugEnabled,
 	resolveEmbeddingProvider,
 	type MnemopiEmbeddingProvider,
 } from "./runtime-options";
@@ -38,8 +37,6 @@ export type LocalModelInitOptions = {
 };
 
 export type LocalModelInitializer = (options: LocalModelInitOptions) => Promise<LocalEmbeddingModel>;
-
-const QUERY_CACHE_MAX = 512;
 
 let providerOverride: EmbeddingProvider | null = null;
 let localModelPromise: Promise<LocalEmbeddingModel> | null = null;
@@ -83,22 +80,6 @@ function queryCacheKey(text: string): string {
 	return `${providerId}::${defaultModel()}::${activeEmbeddingOptions()?.apiUrl ?? ""}::${text}`;
 }
 
-function cacheGet(key: string): Vector | undefined {
-	const hit = queryCache.get(key);
-	if (hit === undefined) return undefined;
-	queryCache.delete(key);
-	queryCache.set(key, hit); // refresh recency
-	return hit;
-}
-
-function cacheSet(key: string, value: Vector): void {
-	if (queryCache.size >= QUERY_CACHE_MAX) {
-		const oldest = queryCache.keys().next().value;
-		if (oldest !== undefined) queryCache.delete(oldest);
-	}
-	queryCache.set(key, value);
-}
-
 function inTestRuntime(): boolean {
 	return process.env.NODE_ENV === "test" || process.env.BUN_ENV === "test";
 }
@@ -109,40 +90,6 @@ export function embeddingsDisabled(): boolean {
 		return active.disabled;
 	}
 	return process.env.MNEMOPI_NO_EMBEDDINGS !== undefined && process.env.MNEMOPI_NO_EMBEDDINGS !== "";
-}
-
-function effectiveMaxInputChars(): number {
-	const override = activeEmbeddingOptions()?.maxInputChars;
-	if (override !== undefined) return Math.max(0, Math.trunc(override));
-	const envValue = Number.parseInt(process.env.MNEMOPI_EMBEDDING_MAX_INPUT_CHARS ?? "", 10);
-	if (Number.isFinite(envValue) && envValue >= 0) return envValue;
-	return 8192;
-}
-
-const EMBEDDING_ELISION_MARKER = "\n\n[...]\n\n";
-
-/** Right-clip an oversized input to `max` chars while preserving both ends. */
-function clipToWindow(text: string, max: number): string {
-	if (text.length <= max) return text;
-	if (max <= EMBEDDING_ELISION_MARKER.length + 16) return text.slice(text.length - max);
-	const budget = max - EMBEDDING_ELISION_MARKER.length;
-	const headLen = budget >>> 1;
-	const tailLen = budget - headLen;
-	return text.slice(0, headLen) + EMBEDDING_ELISION_MARKER + text.slice(text.length - tailLen);
-}
-
-function capInputs(texts: readonly string[]): readonly string[] {
-	const max = effectiveMaxInputChars();
-	if (max === 0) return texts;
-	let trimmed: string[] | null = null;
-	for (let i = 0; i < texts.length; i++) {
-		const text = texts[i] ?? "";
-		if (text.length <= max) continue;
-		if (trimmed === null) trimmed = texts.slice() as string[];
-		trimmed[i] = clipToWindow(text, max);
-	}
-	if (trimmed === null) return texts;
-	return trimmed;
 }
 
 function embeddingApiKey(): string {
@@ -174,12 +121,8 @@ export function currentEmbeddingModel(): string {
 }
 
 function isOpenRouterHost(baseUrl: string): boolean {
-	try {
-		const host = new URL(baseUrl).hostname;
-		return host === "openrouter.ai" || host.endsWith(".openrouter.ai");
-	} catch {
-		return false;
-	}
+	const host = new URL(baseUrl).hostname;
+	return host === "openrouter.ai" || host.endsWith(".openrouter.ai");
 }
 
 export function isApiModel(modelName: string): boolean {
@@ -226,25 +169,21 @@ async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | nul
 	if (apiKey !== "") {
 		headers.Authorization = `Bearer ${apiKey}`;
 	}
-	try {
-		const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/embeddings`, {
-			method: "POST",
-			headers,
-			body: JSON.stringify({ model: defaultModel(), input: texts }),
-			signal: AbortSignal.timeout(30_000),
-		});
-		if (!response.ok) {
-			return null;
-		}
-		const { data: rows } = (await response.json()) as { data?: Array<{ embedding: number[] }> };
-		if (rows === undefined) {
-			return null;
-		}
-		apiCallCount += 1;
-		return rows.map(row => new Float32Array(row.embedding));
-	} catch {
+	const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/embeddings`, {
+		method: "POST",
+		headers,
+		body: JSON.stringify({ model: defaultModel(), input: texts }),
+		signal: AbortSignal.timeout(30_000),
+	});
+	if (!response.ok) {
 		return null;
 	}
+	const { data: rows } = (await response.json()) as { data?: Array<{ embedding: number[] }> };
+	if (rows === undefined) {
+		return null;
+	}
+	apiCallCount += 1;
+	return rows.map(row => new Float32Array(row.embedding));
 }
 
 const VERSION = "18.2.1"; // kept in sync with reduced/mnemopi/package.json
@@ -291,11 +230,7 @@ async function providerAvailable(provider: EmbeddingProvider): Promise<boolean> 
 	if (provider.available === undefined) {
 		return true;
 	}
-	try {
-		return await provider.available();
-	} catch {
-		return false;
-	}
+	return await provider.available();
 }
 
 export function setEmbeddingProviderForTests(provider: EmbeddingProvider | null | undefined): void {
@@ -357,14 +292,14 @@ export async function embedQuery(text: string): Promise<Vector | null> {
 		return null;
 	}
 	const key = queryCacheKey(text);
-	const cached = cacheGet(key);
+	const cached = queryCache.get(key);
 	if (cached !== undefined) {
 		return cached;
 	}
 	const vectors = await embed([text]);
 	const vector = vectors?.[0] ?? null;
 	if (vector !== null) {
-		cacheSet(key, vector);
+		queryCache.set(key, vector);
 	}
 	return vector;
 }
@@ -373,18 +308,11 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 	if (texts.length === 0 || embeddingsDisabled()) {
 		return null;
 	}
-	texts = capInputs(texts);
-	const activeProvider = resolveEmbeddingProvider(activeEmbeddingOptions()?.provider);
+	const activeProvider = resolveEmbeddingProvider(activeEmbeddingOptions()?.provider) ?? providerOverride ?? undefined;
 	if (activeProvider !== undefined) {
+		// A throwing provider degrades to "no embeddings" (null), never crashes recall.
 		try {
 			return await collectMatrix(await activeProvider.embed(texts));
-		} catch {
-			return null;
-		}
-	}
-	if (providerOverride !== null) {
-		try {
-			return await collectMatrix(await providerOverride.embed(texts));
 		} catch {
 			return null;
 		}
@@ -394,7 +322,7 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 	}
 	if (texts.length === 1) {
 		const key = queryCacheKey(texts[0] ?? "");
-		const cached = cacheGet(key);
+		const cached = queryCache.get(key);
 		if (cached !== undefined) {
 			return [cached];
 		}
@@ -408,7 +336,7 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 		if (vectors.length === 1) {
 			const vector = vectors[0];
 			if (vector !== undefined) {
-				cacheSet(queryCacheKey(texts[0] ?? ""), vector);
+				queryCache.set(queryCacheKey(texts[0] ?? ""), vector);
 			}
 		}
 		return vectors;

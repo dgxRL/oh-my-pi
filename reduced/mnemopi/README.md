@@ -20,6 +20,23 @@ sleep ───────▶ claim rows older than TTL/2, group by source, com
                 then tier-degrade old episodes (tier1→2→3)
 ```
 
+
+## Edge-case policy
+
+Second-pass rule: the reduced src carries **no defensive armor**. All best-effort
+`try/catch` swallows, schema-existence probes (`tableExists` guards), savepoint
+rollback loops, tx-depth re-entrancy tracking, fetch retries, input-size caps,
+LRU eviction, and "never blocks the caller" wrappers were removed — errors fail
+fast and bubble to the caller. The only remaining `try` blocks are load-bearing
+semantics, each pinned by a kept test:
+
+| Location | Why it stays |
+|---|---|
+| `db.ts` / `veracity-consolidation.ts` transaction helpers | ROLLBACK-and-rethrow on failure (correctness, not swallowing); nested calls join the open transaction via `db.inTransaction` |
+| `embeddings.ts` provider call | a throwing provider degrades to `null` (test: "returns null instead of throwing when the provider fails") |
+| `embeddings.ts` local-model load | transient init failure → `null`, promise reset → retry succeeds (test: "retries local model initialization after a transient failure") |
+| `cost-log.ts` | `try/finally` close-only (resource cleanup, no swallowing) |
+
 Supporting cast: `temporal-parser` (NL date extraction feeding temporal boost), `query-intent` +
 `synonyms` (query rewriting), `mmr` (diversity), `aaak` (sleep compression), `episodic-graph`
 (gists + graph_edges for consolidated memories), `veracity-consolidation` (fact dedup/conflicts),

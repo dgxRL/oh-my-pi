@@ -12,13 +12,13 @@ import { EpisodicGraph } from "../episodic-graph";
 import {
 	consolidateToEpisodic,
 	degradeEpisodic,
-	detectLanguage,
 	getConsolidationLog,
 	getContaminated,
 	getEpisodicStats,
 	sleep,
 	sleepAllSessions,
 } from "./consolidate";
+import { detectLanguage } from "./helpers";
 import { factRecall, formatContext, recall, recallEnhanced } from "./recall";
 import { initBeam } from "./schema";
 import {
@@ -228,7 +228,7 @@ export class BeamMemory implements BeamMemoryState {
 	}
 
 	detectLanguage(text: string): string {
-		return detectLanguage(this, text);
+		return detectLanguage(text);
 	}
 
 	recall(query: string, topK = 40, options: RecallOptions = {}): Promise<RecallResult[]> {

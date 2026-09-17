@@ -8,16 +8,18 @@
  * in-memory cosine), shmr.
  */
 import { normalizedRecallWeights, temporalHalflifeHours } from "../../config";
+import { nowIso } from "../../util/datetime";
+import { placeholders } from "../../util/sql";
 import { embedQuery } from "../embeddings";
 import { mmrRerank } from "../mmr";
 import { adjustWeights, classifyIntent } from "../query-intent";
 import { getSynonyms, normalizeQuery, STOP_WORDS as QUERY_STOP_WORDS } from "../synonyms";
 import { extractTemporal } from "../temporal-parser";
 import { cosineSimilarity } from "../vector-math";
+import { asNullableString, asNumber, asString, type Row } from "./row";
 import type { BeamMemoryState, RecallEnhancedOptions, RecallOptions, RecallResult } from "./types";
 
 type DbValue = string | number | null | Uint8Array;
-type Row = Record<string, unknown>;
 type TierLabel = "working" | "episodic";
 
 type RecallOptionsInternal = RecallOptions & {
@@ -154,23 +156,6 @@ const FACT_QUERY_FILLER_WORDS = new Set([
 
 const FACT_CLITIC_FRAGMENTS = new Set(["d", "ll", "m", "re", "s", "t", "ve"]);
 const FLAT_FACT_SEARCH_NOISE: Record<string, true> = { entity: true, fact: true };
-
-function nowIso(): string {
-	return new Date().toISOString();
-}
-
-function asNumber(value: unknown, fallback = 0): number {
-	const n = typeof value === "number" ? value : Number(value);
-	return Number.isFinite(n) ? n : fallback;
-}
-
-function asString(value: unknown): string {
-	return typeof value === "string" ? value : "";
-}
-
-function asNullableString(value: unknown): string | null {
-	return typeof value === "string" ? value : null;
-}
 
 function round4(value: number): number {
 	return Math.round(value * 10000) / 10000;
@@ -441,23 +426,8 @@ function ftsQuery(query: string, useSynonyms = true): string {
 	return tokens.map(ftsPhrase).join(" OR ");
 }
 
-function placeholders(count: number): string {
-	return new Array<string>(count).fill("?").join(",");
-}
-
 function queryAll(beam: BeamMemoryState, sql: string, params: readonly DbValue[] = []): Row[] {
 	return beam.db.query(sql).all(...params) as Row[];
-}
-
-function queryGet(beam: BeamMemoryState, sql: string, params: readonly DbValue[] = []): Row | null {
-	return (beam.db.query(sql).get(...params) as Row | null) ?? null;
-}
-
-function tableExists(beam: BeamMemoryState, table: string): boolean {
-	return (
-		queryGet(beam, "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?", [table]) !==
-		null
-	);
 }
 
 function factsHaveScopeColumn(beam: BeamMemoryState): boolean {
@@ -543,34 +513,29 @@ function ftsRows(
 	limit: number,
 	useSynonyms = true,
 ): Row[] {
-	if (!tableExists(beam, table)) return [];
-	try {
-		// Superseded rows must not occupy LIMIT slots — visibility filtering
-		// would drop them AFTER they displaced live rows. Correlated EXISTS (not
-		// `id IN (SELECT …)`) probes the primary key only for MATCH-produced rows.
-		if (table === "fts_working") {
-			return queryAll(
-				beam,
-				`SELECT f.id, f.rank FROM fts_working f
-				 WHERE f.fts_working MATCH ?
-				   AND EXISTS (SELECT 1 FROM working_memory w WHERE w.id = f.id AND w.superseded_by IS NULL
-				       AND (w.valid_until IS NULL OR w.valid_until > ?))
-				 ORDER BY f.rank, f.id LIMIT ?`,
-				[ftsQuery(query, useSynonyms), nowIso(), limit],
-			);
-		}
+	// Superseded rows must not occupy LIMIT slots — visibility filtering
+	// would drop them AFTER they displaced live rows. Correlated EXISTS (not
+	// `id IN (SELECT …)`) probes the primary key only for MATCH-produced rows.
+	if (table === "fts_working") {
 		return queryAll(
 			beam,
-			`SELECT f.rowid, f.rank FROM fts_episodes f
-			 WHERE f.fts_episodes MATCH ?
-			   AND EXISTS (SELECT 1 FROM episodic_memory e WHERE e.rowid = f.rowid AND e.superseded_by IS NULL
-			       AND (e.valid_until IS NULL OR e.valid_until > ?))
-			 ORDER BY f.rank, f.rowid LIMIT ?`,
+			`SELECT f.id, f.rank FROM fts_working f
+			 WHERE f.fts_working MATCH ?
+			   AND EXISTS (SELECT 1 FROM working_memory w WHERE w.id = f.id AND w.superseded_by IS NULL
+			       AND (w.valid_until IS NULL OR w.valid_until > ?))
+			 ORDER BY f.rank, f.id LIMIT ?`,
 			[ftsQuery(query, useSynonyms), nowIso(), limit],
 		);
-	} catch {
-		return [];
 	}
+	return queryAll(
+		beam,
+		`SELECT f.rowid, f.rank FROM fts_episodes f
+		 WHERE f.fts_episodes MATCH ?
+		   AND EXISTS (SELECT 1 FROM episodic_memory e WHERE e.rowid = f.rowid AND e.superseded_by IS NULL
+		       AND (e.valid_until IS NULL OR e.valid_until > ?))
+		 ORDER BY f.rank, f.rowid LIMIT ?`,
+		[ftsQuery(query, useSynonyms), nowIso(), limit],
+	);
 }
 
 function normalizeRanks(rows: readonly Row[], key: string): Map<string | number, number> {
@@ -594,19 +559,15 @@ function normalizeRanks(rows: readonly Row[], key: string): Map<string | number,
 
 function parseEmbedding(raw: unknown): number[] | null {
 	if (typeof raw !== "string") return null;
-	try {
-		const parsed = JSON.parse(raw) as unknown;
-		if (!Array.isArray(parsed)) return null;
-		const vector = new Array<number>(parsed.length);
-		for (let i = 0; i < parsed.length; i += 1) {
-			const value = Number(parsed[i]);
-			if (!Number.isFinite(value)) return null;
-			vector[i] = value;
-		}
-		return vector;
-	} catch {
-		return null;
+	const parsed = JSON.parse(raw) as unknown;
+	if (!Array.isArray(parsed)) return null;
+	const vector = new Array<number>(parsed.length);
+	for (let i = 0; i < parsed.length; i += 1) {
+		const value = Number(parsed[i]);
+		if (!Number.isFinite(value)) return null;
+		vector[i] = value;
 	}
+	return vector;
 }
 
 function vectorSimilarities(
@@ -615,12 +576,7 @@ function vectorSimilarities(
 	queryEmbedding: readonly number[] | null | undefined,
 ): Map<string, number> {
 	const out = new Map<string, number>();
-	if (
-		queryEmbedding == null ||
-		queryEmbedding.length === 0 ||
-		memoryIds.length === 0 ||
-		!tableExists(beam, "memory_embeddings")
-	) {
+	if (queryEmbedding == null || queryEmbedding.length === 0 || memoryIds.length === 0) {
 		return out;
 	}
 	for (let offset = 0; offset < memoryIds.length; offset += 500) {
@@ -714,6 +670,28 @@ function fallbackCandidates(
 	}));
 }
 
+/**
+ * Per-tier base score. Working memory is keyword-dominated with a superlinear
+ * exact-match bonus; episodic memory fuses dense/FTS/importance linearly.
+ */
+function tierBaseScore(
+	candidate: MemoryCandidate,
+	signals: { lexical: number; keyword: number; importance: number; weights: readonly [number, number, number] },
+): number {
+	const [vecWeight, ftsWeight, importanceWeight] = signals.weights;
+	if (candidate.tierLabel === "episodic") {
+		return Math.max(
+			candidate.signals.dense * vecWeight + candidate.signals.fts * ftsWeight + signals.importance * importanceWeight,
+			signals.lexical * 0.8,
+		);
+	}
+	const keywordShare = (1 - importanceWeight) * 0.6;
+	let base =
+		signals.keyword * keywordShare + signals.importance * importanceWeight + signals.keyword * signals.keyword * 0.08;
+	if (candidate.signals.dense > 0) base = base * 0.8 + candidate.signals.dense * 0.2;
+	return base;
+}
+
 function scoreCandidate(
 	candidate: MemoryCandidate,
 	queryTokens: readonly string[],
@@ -730,25 +708,13 @@ function scoreCandidate(
 			: lexicalRelevance(queryTokens, searchableContent, normalizedQueryLower);
 	const minRel = minimumRelevance(queryTokens);
 	if (lexical < minRel && candidate.signals.dense < 0.65) return null;
-	const [vecWeight, ftsWeight, importanceWeight] = weights;
 	const importance = asNumber(candidate.row.importance, 0.5);
 	const decay =
 		options.queryTime == null
 			? recencyDecay(candidate.row.timestamp, 72)
 			: temporalBoost(candidate.row.timestamp, parseQueryTime(options.queryTime), 72);
 	const keyword = Math.max(lexical, candidate.signals.fts * 0.6);
-	let baseScore: number;
-	if (candidate.tierLabel === "episodic") {
-		baseScore = Math.max(
-			candidate.signals.dense * vecWeight + candidate.signals.fts * ftsWeight + importance * importanceWeight,
-			lexical * 0.8,
-		);
-	} else {
-		const kwShare = (1 - importanceWeight) * 0.6;
-		baseScore = keyword * kwShare + importance * importanceWeight + keyword * keyword * 0.08;
-		if (candidate.signals.dense > 0) baseScore = baseScore * 0.8 + candidate.signals.dense * 0.2;
-	}
-	let score = baseScore * (0.7 + 0.3 * decay);
+	let score = tierBaseScore(candidate, { lexical, keyword, importance, weights }) * (0.7 + 0.3 * decay);
 	const temporalWeight = options.temporalWeight ?? 0;
 	let temporalScore = 0;
 	if (temporalWeight > 0) {
@@ -1131,36 +1097,30 @@ export function formatContext(beam: BeamMemoryState, results: readonly RecallRes
 }
 
 export function factRecall(beam: BeamMemoryState, query: string, topK = 30): FactRecallResult[] {
-	if (topK <= 0 || !tableExists(beam, "facts")) return [];
+	if (topK <= 0) return [];
 	let matched: Row[] = [];
-	if (tableExists(beam, "fts_facts")) {
-		try {
-			const visibility = factVisibilityWhere(beam, "facts");
-			matched = queryAll(
-				beam,
-				`SELECT fts_facts.rowid, fts_facts.rank
-				 FROM fts_facts
-				 JOIN facts ON facts.rowid = fts_facts.rowid
-				 WHERE fts_facts MATCH ? AND ${visibility.where}
-				 ORDER BY fts_facts.rank, fts_facts.rowid
-				 LIMIT ?`,
-				[ftsQuery(query), ...visibility.params, topK * 3],
-			);
-		} catch {
-			matched = [];
-		}
-	}
+	const visibility = factVisibilityWhere(beam, "facts");
+	matched = queryAll(
+		beam,
+		`SELECT fts_facts.rowid, fts_facts.rank
+		 FROM fts_facts
+		 JOIN facts ON facts.rowid = fts_facts.rowid
+		 WHERE fts_facts MATCH ? AND ${visibility.where}
+		 ORDER BY fts_facts.rank, fts_facts.rowid
+		 LIMIT ?`,
+		[ftsQuery(query), ...visibility.params, topK * 3],
+	);
 	if (matched.length === 0) {
 		const seen = new Set<number>();
 		for (const token of expandedTokens(query).slice(0, 6)) {
-			const visibility = factVisibilityWhere(beam, "");
+			const likeVisibility = factVisibilityWhere(beam, "");
 			const rows = queryAll(
 				beam,
 				`SELECT rowid
 				 FROM facts
 				 WHERE (subject LIKE ? OR predicate LIKE ? OR object LIKE ?) AND ${visibility.where}
 				 LIMIT ?`,
-				[`%${token}%`, `%${token}%`, `%${token}%`, ...visibility.params, topK],
+				[`%${token}%`, `%${token}%`, `%${token}%`, ...likeVisibility.params, topK],
 			);
 			for (const row of rows) {
 				const rowid = asNumber(row.rowid);
@@ -1174,7 +1134,7 @@ export function factRecall(beam: BeamMemoryState, query: string, topK = 30): Fac
 	if (matched.length === 0) return [];
 	const rowids = matched.map(row => asNumber(row.rowid)).filter(rowid => rowid > 0);
 	if (rowids.length === 0) return [];
-	const visibility = factVisibilityWhere(beam, "");
+	const finalVisibility = factVisibilityWhere(beam, "");
 	const ranks = normalizeRanks(matched, "rowid");
 	const normalized = normalizeQuery(query).toLowerCase();
 	const rows = queryAll(
@@ -1184,7 +1144,7 @@ export function factRecall(beam: BeamMemoryState, query: string, topK = 30): Fac
 		 WHERE rowid IN (${placeholders(rowids.length)}) AND ${visibility.where}
 		 ORDER BY confidence DESC
 		 LIMIT ?`,
-		[...rowids, ...visibility.params, rowids.length],
+		[...rowids, ...finalVisibility.params, rowids.length],
 	);
 	return rows
 		.map(row => {

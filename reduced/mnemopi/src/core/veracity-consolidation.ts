@@ -21,14 +21,6 @@ export const VERACITY_ALLOWED: Record<Veracity, true> = Object.freeze({
 	unknown: true,
 });
 
-const TX_DEPTH = Symbol("mnemopi.veracity.txDepth");
-
-type TxDatabase = Database & {
-	readonly inTransaction?: boolean;
-	readonly in_transaction?: boolean;
-	[TX_DEPTH]?: number;
-};
-
 export interface ConsolidatedFact {
 	readonly subject: string;
 	readonly predicate: string;
@@ -87,24 +79,15 @@ function isVeracity(value: string): value is Veracity {
 	return Object.hasOwn(VERACITY_ALLOWED, value);
 }
 
-function sqliteInTransaction(db: Database): boolean {
-	const txDb = db as TxDatabase;
-	return txDb.inTransaction === true || txDb.in_transaction === true || (txDb[TX_DEPTH] ?? 0) > 0;
-}
-
 function parseSources(raw: string | null): string[] {
 	if (raw === null || raw === "") return [];
-	try {
-		const parsed: unknown = JSON.parse(raw);
-		if (!Array.isArray(parsed)) return [];
-		const out: string[] = [];
-		for (const item of parsed) {
-			if (typeof item === "string") out.push(item);
-		}
-		return out;
-	} catch {
-		return [];
+	const parsed: unknown = JSON.parse(raw);
+	if (!Array.isArray(parsed)) return [];
+	const out: string[] = [];
+	for (const item of parsed) {
+		if (typeof item === "string") out.push(item);
 	}
+	return out;
 }
 
 function nowIso(): string {
@@ -213,39 +196,15 @@ export class VeracityConsolidator {
 
 	serializedWrite<T>(body: () => T): T {
 		const conn = this.conn;
-		if (sqliteInTransaction(conn)) return body();
-
-		let started = false;
+		if (conn.inTransaction) return body();
+		conn.exec("BEGIN IMMEDIATE");
 		try {
-			conn.exec("BEGIN IMMEDIATE");
-			started = true;
-			(conn as TxDatabase)[TX_DEPTH] = ((conn as TxDatabase)[TX_DEPTH] ?? 0) + 1;
 			const result = body();
 			conn.exec("COMMIT");
 			return result;
 		} catch (error) {
-			if (
-				!started &&
-				error instanceof Error &&
-				/within a transaction|transaction.*active|cannot start/i.test(error.message)
-			) {
-				return body();
-			}
-			if (started) {
-				try {
-					conn.exec("ROLLBACK");
-				} catch {
-					// Preserve original error.
-				}
-			}
+			conn.exec("ROLLBACK");
 			throw error;
-		} finally {
-			if (started) {
-				const txDb = conn as TxDatabase;
-				const depth = (txDb[TX_DEPTH] ?? 1) - 1;
-				if (depth > 0) txDb[TX_DEPTH] = depth;
-				else delete txDb[TX_DEPTH];
-			}
 		}
 	}
 
