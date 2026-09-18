@@ -112,7 +112,7 @@ describe("optional embeddings", () => {
 		});
 	});
 
-	it("returns null instead of throwing when the provider fails", async () => {
+	it("propagates provider failures (fail fast)", async () => {
 		await withEnv({ MNEMOPI_NO_EMBEDDINGS: undefined }, async () => {
 			setEmbeddingProviderForTests({
 				embed() {
@@ -120,8 +120,8 @@ describe("optional embeddings", () => {
 				},
 			});
 
-			expect(await embed(["hello"])).toBeNull();
-			expect(await embedQuery("hello")).toBeNull();
+			await expect(embed(["hello"])).rejects.toThrow("provider unavailable");
+			await expect(embedQuery("hello")).rejects.toThrow("provider unavailable");
 		});
 	});
 
@@ -239,7 +239,7 @@ describe("optional embeddings", () => {
 					};
 				});
 
-				expect(await embed(["first"])).toBeNull();
+				await expect(embed(["first"])).rejects.toThrow("transient init failure");
 				expect(await embed(["second"])).toEqual([new Float32Array([6, 115])]);
 				expect(initCalls).toBe(2);
 				expect(observedCacheDirs).toEqual([getFastembedCacheDir(), getFastembedCacheDir()]);

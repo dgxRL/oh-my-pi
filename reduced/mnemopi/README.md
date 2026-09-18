@@ -33,9 +33,12 @@ semantics, each pinned by a kept test:
 | Location | Why it stays |
 |---|---|
 | `db.ts` / `veracity-consolidation.ts` transaction helpers | ROLLBACK-and-rethrow on failure (correctness, not swallowing); nested calls join the open transaction via `db.inTransaction` |
-| `embeddings.ts` provider call | a throwing provider degrades to `null` (test: "returns null instead of throwing when the provider fails") |
-| `embeddings.ts` local-model load | transient init failure → `null`, promise reset → retry succeeds (test: "retries local model initialization after a transient failure") |
 | `cost-log.ts` | `try/finally` close-only (resource cleanup, no swallowing) |
+
+`embeddings.ts` is now try-free: provider failures and local-model init
+failures propagate (fail fast, tests assert the rejections), and the reduced
+copy does no local-model promise caching — hosts needing warm caching wrap
+their own initializer.
 
 Supporting cast: `temporal-parser` (NL date extraction feeding temporal boost), `query-intent` +
 `synonyms` (query rewriting), `mmr` (diversity), `aaak` (sleep compression), `episodic-graph`
@@ -49,7 +52,7 @@ Supporting cast: `temporal-parser` (NL date extraction feeding temporal boost), 
 | `src/db.ts` | `packages/mnemopi/src/db.ts` | Dropped page-size detection (`getconf`), extension plumbing kept minimal |
 | `src/config.ts` | `.../src/config.ts` | Only knobs the reduced modules read; data dir moved to `~/.omp/reduced-mnemopi/data` so runs never touch real data |
 | `src/util/ids.ts` | `.../src/util/ids.ts` | Verbatim (16-char sha256 content ids) |
-| `src/util/regex.ts` | `.../src/util/regex.ts` | Verbatim (tokenization, stopwords, synonyms, CJK) |
+| `src/util/regex.ts` | `.../src/util/regex.ts` | English-only: tokenization, stopwords, synonyms (CJK helpers, language sniffing dropped) |
 | `src/util/datetime.ts` | `.../src/util/datetime.ts` | Minimal ISO parse helpers |
 | `src/core/beam/schema.ts` | `.../src/core/beam/schema.ts` | Fresh-create DDL only — no `addColumnIfMissing` migrations; dropped memoria_timelines/instructions/preferences/kg, memory_validations, triples |
 | `src/core/beam/types.ts` | `.../src/core/beam/types.ts` | Trimmed to used types |
@@ -70,7 +73,7 @@ Supporting cast: `temporal-parser` (NL date extraction feeding temporal boost), 
 | `src/core/vector-index.ts` | `.../src/core/vector-index.ts` | Pure-TS scoring replacing the `pi-natives` kernel |
 | `src/core/episodic-graph.ts` | `.../src/core/episodic-graph.ts` | gists/graph_edges schema, gist extraction, ctx + lexical linking; dropped entity/fact extraction and traversal |
 | `src/core/veracity-consolidation.ts` | `.../src/core/veracity-consolidation.ts` | Kept dedup/Bayesian/conflict/close semantics |
-| `src/core/chat-normalize.ts` `cost-log.ts` `token-counter.ts` | same | Faithful ports (used by `text-utilities.test.ts`) |
+| `src/core/chat-normalize.ts` `cost-log.ts` `token-counter.ts` | same | Faithful ports; token-counter uses a flat cost rate (per-model pricing table dropped, no vendor model names) |
 
 **Dropped entirely**: MCP server + tools, CLI, diagnose, dr/recovery, plugins, shmr,
 polyphonic-recall, typed-memory/AAAK typed store, streaming, query-cache, orchestrator,

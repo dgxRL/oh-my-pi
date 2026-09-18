@@ -8,19 +8,19 @@ import { getCostStats, initCostLog, logCost } from "../src/core/cost-log";
 import { estimateCost, estimateTokens } from "../src/core/token-counter";
 
 describe("token counter", () => {
-	it("uses the Python fallback token estimate and pricing table", () => {
+	it("uses the Python fallback token estimate and a flat cost rate", () => {
 		expect(estimateTokens("")).toBe(0);
 		expect(estimateTokens("abcdefghijkl")).toBe(3);
 		expect(estimateTokens("abc")).toBe(0);
-		expect(estimateCost(1_000_000, "gpt-4o-mini")).toEqual({
+		expect(estimateCost(1_000_000, "model-x")).toEqual({
 			tokens: 1_000_000,
-			model: "gpt-4o-mini",
-			cost_usd: 0.15,
-			rate_per_1m: 0.15,
+			model: "model-x",
+			cost_usd: 3.0,
+			rate_per_1m: 3.0,
 		});
-		expect(estimateCost(333, "unknown-model")).toEqual({
+		expect(estimateCost(333, "unlisted-model")).toEqual({
 			tokens: 333,
-			model: "unknown-model",
+			model: "unlisted-model",
 			cost_usd: 0.000999,
 			rate_per_1m: 3.0,
 		});
@@ -33,8 +33,8 @@ describe("cost log", () => {
 
 		initCostLog(dbPath);
 		logCost("session-a", 2, 100, 0.0003, "default", dbPath);
-		logCost("session-a", 3, 200, 0.0006, "claude-sonnet-4", dbPath);
-		logCost("session-b", 5, 400, 0.0012, "gpt-4o", dbPath);
+		logCost("session-a", 3, 200, 0.0006, "model-a", dbPath);
+		logCost("session-b", 5, 400, 0.0012, "model-b", dbPath);
 
 		expect(getCostStats("session-a", dbPath)).toEqual({
 			total_calls: 2,

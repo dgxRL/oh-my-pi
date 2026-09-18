@@ -18,7 +18,6 @@ import {
 	sleep,
 	sleepAllSessions,
 } from "./consolidate";
-import { detectLanguage } from "./helpers";
 import { factRecall, formatContext, recall, recallEnhanced } from "./recall";
 import { initBeam } from "./schema";
 import {
@@ -225,10 +224,6 @@ export class BeamMemory implements BeamMemoryState {
 		},
 	): string {
 		return consolidateToEpisodic(this, summary, sourceWmIds, source, importance, options);
-	}
-
-	detectLanguage(text: string): string {
-		return detectLanguage(text);
 	}
 
 	recall(query: string, topK = 40, options: RecallOptions = {}): Promise<RecallResult[]> {

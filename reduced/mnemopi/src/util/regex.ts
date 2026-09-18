@@ -1,6 +1,5 @@
-/** Reduced port of packages/mnemopi/src/util/regex.ts — tokenization, stopwords, synonyms, CJK helpers. */
+/** Reduced port of packages/mnemopi/src/util/regex.ts — tokenization, stopwords, synonyms. */
 const RECALL_TOKEN_RE = /[a-z0-9][a-z0-9_.:/+-]*/g;
-const CJK_RE = /[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]/;
 export const FACT_MATCH_STOPWORDS: Record<string, true> = {
 	a: true,
 	an: true,
@@ -67,18 +66,6 @@ export const RECALL_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
 	imposter: ["self-doubt", "doubt", "insecure"],
 };
 
-export function isCjkChar(ch: string): boolean {
-	return (
-		(ch >= "一" && ch <= "鿿") || (ch >= "぀" && ch <= "ヿ") || (ch >= "가" && ch <= "힯")
-	);
-}
-
-export function hasCjk(text: string): boolean {
-	return CJK_RE.test(text);
-}
-
-export const containsSpacelessCjk = hasCjk;
-
 export function recallTokens(text: string): string[] {
 	RECALL_TOKEN_RE.lastIndex = 0;
 	const tokens: string[] = [];
@@ -119,29 +106,6 @@ export function minimumRecallRelevance(queryTokens: readonly string[]): number {
 	if (queryTokens.length >= 4) return 0.3;
 	if (queryTokens.length === 3) return 0.5;
 	return 0.15;
-}
-
-export function cjkFtsTerms(text: string): string[] {
-	const chars: string[] = [];
-	for (let i = 0; i < text.length; i++) {
-		const ch = text.charAt(i);
-		if (isCjkChar(ch)) chars.push(ch);
-	}
-	if (chars.length === 0) return [];
-	const terms: string[] = [];
-	const seen = new Set<string>();
-	for (const ch of chars) {
-		if (seen.has(ch)) continue;
-		seen.add(ch);
-		terms.push(ch);
-	}
-	for (let i = 1; i < chars.length; i++) {
-		const bigram = `${chars[i - 1]}${chars[i]}`;
-		if (seen.has(bigram)) continue;
-		seen.add(bigram);
-		terms.push(`"${bigram}"`);
-	}
-	return terms;
 }
 
 export function ftsQueryTerms(query: string): string[] {

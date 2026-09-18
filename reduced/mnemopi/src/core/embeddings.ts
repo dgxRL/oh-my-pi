@@ -39,7 +39,6 @@ export type LocalModelInitOptions = {
 export type LocalModelInitializer = (options: LocalModelInitOptions) => Promise<LocalEmbeddingModel>;
 
 let providerOverride: EmbeddingProvider | null = null;
-let localModelPromise: Promise<LocalEmbeddingModel> | null = null;
 let localModelInitializer: LocalModelInitializer = defaultLocalModelInitializer;
 let apiCallCount = 0;
 
@@ -202,28 +201,19 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 	if (isApiModel(defaultModel()) || embeddingsDisabled() || inTestRuntime()) {
 		return null;
 	}
-	if (localModelPromise !== null) {
-		return localModelPromise;
-	}
-
 	const modelName = fastembedModelName(defaultModel());
 	if (modelName === null) {
 		return null;
 	}
 	const cacheDir = defaultCacheDir();
 	mkdirSync(cacheDir, { recursive: true });
-	const loading = localModelInitializer({
+	// No promise caching: a failing initializer throws straight through; hosts
+	// that need warm caching wrap their own initializer.
+	return localModelInitializer({
 		model: modelName,
 		cacheDir,
 		showDownloadProgress: false,
 	});
-	localModelPromise = loading;
-	try {
-		return await loading;
-	} catch {
-		if (localModelPromise === loading) localModelPromise = null;
-		return null;
-	}
 }
 
 async function providerAvailable(provider: EmbeddingProvider): Promise<boolean> {
@@ -242,7 +232,6 @@ export const setEmbeddingProvider = setEmbeddingProviderForTests;
 
 export function setLocalModelInitializerForTests(initializer: LocalModelInitializer | null | undefined): void {
 	localModelInitializer = initializer ?? defaultLocalModelInitializer;
-	localModelPromise = null;
 	queryCache.clear();
 }
 
@@ -250,7 +239,6 @@ export const setLocalModelInitializer = setLocalModelInitializerForTests;
 
 export function resetEmbeddingProviderForTests(): void {
 	providerOverride = null;
-	localModelPromise = null;
 	localModelInitializer = defaultLocalModelInitializer;
 	apiCallCount = 0;
 	queryCache.clear();
@@ -310,12 +298,7 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 	}
 	const activeProvider = resolveEmbeddingProvider(activeEmbeddingOptions()?.provider) ?? providerOverride ?? undefined;
 	if (activeProvider !== undefined) {
-		// A throwing provider degrades to "no embeddings" (null), never crashes recall.
-		try {
-			return await collectMatrix(await activeProvider.embed(texts));
-		} catch {
-			return null;
-		}
+		return await collectMatrix(await activeProvider.embed(texts));
 	}
 	if (isApiModel(defaultModel())) {
 		return embedApi(texts);
@@ -331,18 +314,14 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 	if (model === null) {
 		return null;
 	}
-	try {
-		const vectors = await collectMatrix(model.embed([...texts]));
-		if (vectors.length === 1) {
-			const vector = vectors[0];
-			if (vector !== undefined) {
-				queryCache.set(queryCacheKey(texts[0] ?? ""), vector);
-			}
+	const vectors = await collectMatrix(model.embed([...texts]));
+	if (vectors.length === 1) {
+		const vector = vectors[0];
+		if (vector !== undefined) {
+			queryCache.set(queryCacheKey(texts[0] ?? ""), vector);
 		}
-		return vectors;
-	} catch {
-		return null;
 	}
+	return vectors;
 }
 
 export function getEmbeddingApiCallCountForTests(): number {

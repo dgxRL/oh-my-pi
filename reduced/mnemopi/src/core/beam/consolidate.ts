@@ -543,14 +543,3 @@ export function getConsolidationLog(beam: BeamMemoryState, limit = 10): Row[] {
 			.all(sourceSession(beam), limit),
 	);
 }
-
-/** Language sniffing used to pick normalization rules; heuristic, no deps. */
-export function detectLanguage(_beam: BeamMemoryState, text: string): string {
-	if (typeof text !== "string" || text.length === 0) return "en";
-	const lower = text.toLowerCase();
-	const russianChars = [...lower].filter(c => "абвгдеёжзийклмнопрстуфхцчшщъыьэюя".includes(c)).length;
-	if (russianChars >= 5) return "ru";
-	if (/[äöüß]/.test(lower)) return "de";
-	if (/[ñáéíóúü¿¡]/.test(lower)) return "es";
-	return "en";
-}

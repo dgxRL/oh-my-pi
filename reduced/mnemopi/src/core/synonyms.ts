@@ -10,7 +10,7 @@ export const SYNONYM_GROUPS = {
 	api: ["endpoint", "interface", "service"],
 	key: ["token", "credential", "secret", "api_key"],
 	user: ["account", "profile", "identity", "person"],
-	model: ["llm", "ai", "provider", "gpt", "claude", "gemini"],
+	model: ["llm", "ai", "provider", "inference"],
 	speed: ["fast", "quick", "performance", "latency", "throughput"],
 	memory: ["recall", "remember", "storage", "retention"],
 	search: ["find", "lookup", "query", "retrieve", "locate"],

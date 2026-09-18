@@ -1,0 +1,91 @@
+flowchart TD
+  classDef write fill:#60a5fa,stroke:#1e3a8a,stroke-width:2px,color:#0c1f45
+  classDef read fill:#34d399,stroke:#065f46,stroke-width:2px,color:#032b20
+  classDef sleep fill:#fb923c,stroke:#7c2d12,stroke-width:2px,color:#431503
+  classDef shared fill:#f472b6,stroke:#831843,stroke-width:2px,color:#4a0d26
+  classDef hub fill:#facc15,stroke:#713f12,stroke-width:2.5px,color:#382303
+  classDef table fill:#a78bfa,stroke:#4c1d95,stroke-width:2px,color:#220c4e
+  classDef ext fill:#67e8f9,stroke:#0e7490,stroke-width:2px,stroke-dasharray:6 3,color:#083344
+
+  style WRITEPATH fill:#bfdbfe,stroke:#1e3a8a,stroke-width:1.5px
+  style SLEEPPATH fill:#fed7aa,stroke:#9a3412,stroke-width:1.5px
+  style READPATH fill:#a7f3d0,stroke:#065f46,stroke-width:1.5px
+  style SHARED fill:#fbcfe8,stroke:#9d174d,stroke-width:1.5px
+  style EXT fill:#cffafe,stroke:#0e7490,stroke-width:1.5px,stroke-dasharray:6 3
+
+  HUB["index.ts<br/>BeamMemory hub class<br/>owns SQLite conn + config"]:::hub
+
+  subgraph WRITEPATH["store.ts — write path"]
+    REM["remember / rememberBatch<br/>dedup by exact content"]:::write --> TRIM["trimWorkingMemory<br/>+ purge artifact cascade"]:::write
+    TRIM --> GET["get / getContext<br/>invalidate / update / forget"]:::write
+    GET --> IMP["exportToDict / importFromDict<br/>4 table importers"]:::write
+    IMP --> SCR["scratchpadWrite / Read / Clear"]:::write
+  end
+
+  subgraph SLEEPPATH["consolidate.ts — sleep path"]
+    SLEEP["sleep / sleepAllSessions<br/>claim rows older than TTL/2"]:::sleep --> CHUNK["splitSleepItems<br/>buildSleepSummary"]:::sleep
+    CHUNK --> C2E["consolidateToEpisodic<br/>summary_of + gist + ctx edge"]:::sleep
+    C2E --> DEG["degradeEpisodic<br/>tier plan loop 1→2→3"]:::sleep
+  end
+
+  subgraph READPATH["recall.ts — read path"]
+    REC["recall / recallEnhanced"]:::read --> CAND["collectMemoryCandidates<br/>FTS ranks + dense cosine"]:::read
+    CAND --> SCORE["scoreCandidate + tierBaseScore<br/>lexical · importance · decay · veracity"]:::read
+    SCORE --> FACT["factRecall<br/>matchFactRowidsByFts / ByLike"]:::read
+    FACT --> FMT["formatContext<br/>Top Facts sandwich"]:::read
+  end
+
+  subgraph SHARED["shared plumbing"]
+    SCHEMA["schema.ts<br/>initBeam DDL + FTS5 triggers"]:::shared
+    HELP["helpers.ts<br/>weights · tokens · decay<br/>lexicalRelevance · vector search"]:::shared
+    ROW["row.ts<br/>asString/asNumber/asRows<br/>scopeFilterClauses"]:::shared
+    EVT["events.ts<br/>emitEvent — Observer fanout"]:::shared
+    SCHEMA ~~~ HELP ~~~ ROW ~~~ EVT
+  end
+
+  WM[("working_memory<br/>+ fts_working")]:::table
+  EM[("episodic_memory<br/>+ fts_episodes")]:::table
+  VEC[("memory_embeddings<br/>JSON vectors")]:::table
+  FAC[("facts + fts_facts")]:::table
+  WM ~~~ EM ~~~ VEC ~~~ FAC
+
+  subgraph EXT["outside beam/ — collaborators"]
+    AAAK["aaak.ts<br/>text compression"]:::ext
+    GRAPH["episodic-graph.ts<br/>gists + graph_edges"]:::ext
+    EMB["embeddings.ts<br/>provider seam"]:::ext
+    LEX["query-intent · mmr · synonyms<br/>temporal-parser · vector-math"]:::ext
+    AAAK ~~~ GRAPH ~~~ EMB ~~~ LEX
+  end
+
+  HOSTS["agent hosts<br/>(memory injection)"]:::ext
+
+  HUB --> REM
+  HUB --> SCHEMA
+  REM --> WM
+  WM --> SLEEP
+  GET --> WM
+  GET --> EM
+  TRIM --> WM
+  IMP --> WM
+  IMP --> EM
+  SLEEP --> CHUNK
+  CHUNK --> AAAK
+  CHUNK --> C2E
+  C2E --> EM
+  C2E --> GRAPH
+  C2E --> EVT
+  DEG --> EM
+  EM --> REC
+  REC --> CAND
+  CAND --> WM
+  CAND --> EM
+  CAND --> VEC
+  CAND --> HELP
+  SCORE --> HELP
+  SCORE --> ROW
+  REC --> EMB
+  REC --> LEX
+  REC --> FACT
+  FACT --> FAC
+  FACT --> FMT
+  FMT --> HOSTS

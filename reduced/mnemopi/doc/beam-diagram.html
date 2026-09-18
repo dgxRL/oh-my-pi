@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>reduced/mnemopi — src/core/beam architecture</title>
+<style>
+	:root { color-scheme: light; }
+	* { box-sizing: border-box; }
+	body {
+		margin: 0; display: flex; height: 100vh; overflow: hidden;
+		font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: #f8fafc;
+	}
+	#panel {
+		width: 340px; flex: none; overflow-y: auto; padding: 18px;
+		border-right: 1px solid #e2e8f0; background: #ffffff;
+	}
+	#panel h1 { font-size: 15px; margin: 0 0 2px; }
+	#panel .sub { color: #64748b; font-size: 12px; margin-bottom: 14px; }
+	#info h2 { font-size: 14px; margin: 0 0 8px; color: #0f172a; }
+	#info .kind {
+		display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: .04em;
+		text-transform: uppercase; padding: 2px 7px; border-radius: 99px; margin-bottom: 8px;
+	}
+	#info p { font-size: 12.5px; line-height: 1.55; color: #334155; margin: 6px 0; }
+	#info ul { font-size: 12.5px; line-height: 1.55; color: #334155; margin: 6px 0; padding-left: 18px; }
+	.legend { font-size: 11.5px; color: #475569; margin-top: 16px; }
+	.legend span { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+	#stage { flex: 1; position: relative; overflow: hidden; cursor: grab; }
+	#stage.dragging { cursor: grabbing; }
+	#stage svg { display: block; }
+	svg.dimmed .node:not(.hot), svg.dimmed .edgePaths path:not(.hot),
+	svg.dimmed .edgeLabel:not(.hot), svg.dimmed .cluster:not(.hot), svg.dimmed .cluster rect { opacity: .14; }
+	svg .node.hot > rect, svg .node.hot > polygon, svg .node.hot > circle { stroke-width: 2.5px; filter: drop-shadow(0 0 4px rgba(37,99,235,.45)); }
+	#hint {
+		position: absolute; bottom: 10px; left: 12px; font-size: 11px; color: #94a3b8;
+		background: rgba(255,255,255,.85); padding: 3px 8px; border-radius: 6px; pointer-events: none;
+	}
+</style>
+</head>
+<body>
+<div id="panel">
+	<h1>core/beam — architecture</h1>
+	<div class="sub">reduced/mnemopi · the storage + retrieval engine below the Mnemopi facade</div>
+	<div id="info">
+		<p>Click any node, edge, or swimlane to inspect it. Scroll to zoom, drag to pan.</p>
+		<p>The three colored lanes are the memory lifecycle: <b>write</b> (blue) fills
+		<code>working_memory</code>, <b>sleep</b> (orange) compresses it into
+		<code>episodic_memory</code>, and <b>read</b> (green) scores all tiers on every recall.</p>
+	</div>
+	<div class="legend">
+		<div><span style="background:#60a5fa"></span>write path — store.ts</div>
+		<div><span style="background:#34d399"></span>read path — recall.ts</div>
+		<div><span style="background:#fb923c"></span>sleep path — consolidate.ts</div>
+		<div><span style="background:#f472b6"></span>shared plumbing</div>
+		<div><span style="background:#a78bfa"></span>SQLite tables</div>
+		<div><span style="background:#67e8f9; border:1px dashed #0e7490"></span>outside collaborators</div>
+	</div>
+</div>
+<div id="stage">
+	<pre class="mermaid">
+flowchart TD
+  classDef write fill:#60a5fa,stroke:#1e3a8a,stroke-width:2px,color:#0c1f45
+  classDef read fill:#34d399,stroke:#065f46,stroke-width:2px,color:#032b20
+  classDef sleep fill:#fb923c,stroke:#7c2d12,stroke-width:2px,color:#431503
+  classDef shared fill:#f472b6,stroke:#831843,stroke-width:2px,color:#4a0d26
+  classDef hub fill:#facc15,stroke:#713f12,stroke-width:2.5px,color:#382303
+  classDef table fill:#a78bfa,stroke:#4c1d95,stroke-width:2px,color:#220c4e
+  classDef ext fill:#67e8f9,stroke:#0e7490,stroke-width:2px,stroke-dasharray:6 3,color:#083344
+
+  style WRITEPATH fill:#bfdbfe,stroke:#1e3a8a,stroke-width:1.5px
+  style SLEEPPATH fill:#fed7aa,stroke:#9a3412,stroke-width:1.5px
+  style READPATH fill:#a7f3d0,stroke:#065f46,stroke-width:1.5px
+  style SHARED fill:#fbcfe8,stroke:#9d174d,stroke-width:1.5px
+  style EXT fill:#cffafe,stroke:#0e7490,stroke-width:1.5px,stroke-dasharray:6 3
+
+  HUB["index.ts<br/>BeamMemory hub class<br/>owns SQLite conn + config"]:::hub
+
+  subgraph WRITEPATH["store.ts — write path"]
+    REM["remember / rememberBatch<br/>dedup by exact content"]:::write --> TRIM["trimWorkingMemory<br/>+ purge artifact cascade"]:::write
+    TRIM --> GET["get / getContext<br/>invalidate / update / forget"]:::write
+    GET --> IMP["exportToDict / importFromDict<br/>4 table importers"]:::write
+    IMP --> SCR["scratchpadWrite / Read / Clear"]:::write
+  end
+
+  subgraph SLEEPPATH["consolidate.ts — sleep path"]
+    SLEEP["sleep / sleepAllSessions<br/>claim rows older than TTL/2"]:::sleep --> CHUNK["splitSleepItems<br/>buildSleepSummary"]:::sleep
+    CHUNK --> C2E["consolidateToEpisodic<br/>summary_of + gist + ctx edge"]:::sleep
+    C2E --> DEG["degradeEpisodic<br/>tier plan loop 1→2→3"]:::sleep
+  end
+
+  subgraph READPATH["recall.ts — read path"]
+    REC["recall / recallEnhanced"]:::read --> CAND["collectMemoryCandidates<br/>FTS ranks + dense cosine"]:::read
+    CAND --> SCORE["scoreCandidate + tierBaseScore<br/>lexical · importance · decay · veracity"]:::read
+    SCORE --> FACT["factRecall<br/>matchFactRowidsByFts / ByLike"]:::read
+    FACT --> FMT["formatContext<br/>Top Facts sandwich"]:::read
+  end
+
+  subgraph SHARED["shared plumbing"]
+    SCHEMA["schema.ts<br/>initBeam DDL + FTS5 triggers"]:::shared
+    HELP["helpers.ts<br/>weights · tokens · decay<br/>lexicalRelevance · vector search"]:::shared
+    ROW["row.ts<br/>asString/asNumber/asRows<br/>scopeFilterClauses"]:::shared
+    EVT["events.ts<br/>emitEvent — Observer fanout"]:::shared
+    SCHEMA ~~~ HELP ~~~ ROW ~~~ EVT
+  end
+
+  WM[("working_memory<br/>+ fts_working")]:::table
+  EM[("episodic_memory<br/>+ fts_episodes")]:::table
+  VEC[("memory_embeddings<br/>JSON vectors")]:::table
+  FAC[("facts + fts_facts")]:::table
+  WM ~~~ EM ~~~ VEC ~~~ FAC
+
+  subgraph EXT["outside beam/ — collaborators"]
+    AAAK["aaak.ts<br/>text compression"]:::ext
+    GRAPH["episodic-graph.ts<br/>gists + graph_edges"]:::ext
+    EMB["embeddings.ts<br/>provider seam"]:::ext
+    LEX["query-intent · mmr · synonyms<br/>temporal-parser · vector-math"]:::ext
+    AAAK ~~~ GRAPH ~~~ EMB ~~~ LEX
+  end
+
+  HOSTS["agent hosts<br/>(memory injection)"]:::ext
+
+  HUB --> REM
+  HUB --> SCHEMA
+  REM --> WM
+  WM --> SLEEP
+  GET --> WM
+  GET --> EM
+  TRIM --> WM
+  IMP --> WM
+  IMP --> EM
+  SLEEP --> CHUNK
+  CHUNK --> AAAK
+  CHUNK --> C2E
+  C2E --> EM
+  C2E --> GRAPH
+  C2E --> EVT
+  DEG --> EM
+  EM --> REC
+  REC --> CAND
+  CAND --> WM
+  CAND --> EM
+  CAND --> VEC
+  CAND --> HELP
+  SCORE --> HELP
+  SCORE --> ROW
+  REC --> EMB
+  REC --> LEX
+  REC --> FACT
+  FACT --> FAC
+  FACT --> FMT
+  FMT --> HOSTS
+
+	</pre>
+	<div id="hint">scroll = zoom · drag = pan · click = inspect</div>
+</div>
+
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+mermaid.initialize({ startOnLoad: false });
+await mermaid.run({ nodes: [document.querySelector(".mermaid")] });
+window.__mermaidDone = true;
+
+const svg = document.querySelector("svg");
+svg.style.maxWidth = "none";
+svg.style.width = "100%";
+svg.style.height = "100%";
+svg.style.position = "absolute";
+svg.style.inset = "0";
+
+// ---- viewport group for pan/zoom ------------------------------------------
+const NS = "http://www.w3.org/2000/svg";
+const viewport = document.createElementNS(NS, "g");
+viewport.id = "viewport";
+while (svg.firstChild) viewport.appendChild(svg.firstChild);
+svg.appendChild(viewport);
+
+const view = { x: 0, y: 0, k: 1 };
+const apply = () => viewport.setAttribute("transform", `translate(${view.x} ${view.y}) scale(${view.k})`);
+function fit() {
+	const [, , vw, vh] = svg.getAttribute("viewBox").split(/\s+/).map(Number);
+	const pad = 24;
+	// Fit to width and anchor the top — tall architecture diagrams pan down.
+	const k = Math.min(0.9, (svg.clientWidth - pad) / vw);
+	view.k = k;
+	view.x = (svg.clientWidth - vw * k) / 2;
+	view.y = pad / 2;
+	apply();
+}
+new ResizeObserver(fit).observe(document.getElementById("stage"));
+window.__fitView = fit;
+
+const stage = document.getElementById("stage");
+stage.addEventListener("wheel", event => {
+	event.preventDefault();
+	const rect = stage.getBoundingClientRect();
+	const cx = event.clientX - rect.left;
+	const cy = event.clientY - rect.top;
+	const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+	const k = Math.min(6, Math.max(0.15, view.k * factor));
+	view.x = cx - (cx - view.x) * (k / view.k);
+	view.y = cy - (cy - view.y) * (k / view.k);
+	view.k = k;
+	apply();
+}, { passive: false });
+
+let drag = null;
+stage.addEventListener("mousedown", event => { drag = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y }; stage.classList.add("dragging"); });
+window.addEventListener("mousemove", event => {
+	if (!drag) return;
+	view.x = drag.vx + (event.clientX - drag.x);
+	view.y = drag.vy + (event.clientY - drag.y);
+	apply();
+});
+window.addEventListener("mouseup", () => { drag = null; stage.classList.remove("dragging"); });
+
+// ---- click-to-highlight + info panel ---------------------------------------
+const DOCS = {
+	HUB: { kind: "hub", title: "index.ts — BeamMemory", html: `<p>The class every facade method lands on. Opens the SQLite connection, runs <code>initBeam</code>, builds the episodic graph, normalizes config (weights, TTL, tier days), and exposes remember / recall / sleep / export-import as methods.</p>` },
+	REM: { kind: "write", title: "remember / rememberBatch", html: `<p>Dedups by exact content in-session: a duplicate <i>updates</i> the row (importance ratchets up via MAX, consolidated_at resets). Fresh content inserts with a time-salted id, derives trust_tier from source, emits MEMORY_ADDED.</p>` },
+	TRIM: { kind: "write", title: "trimWorkingMemory + cascade", html: `<p>Enforces per-session TTL and row limit; IMPORTED-tier rows are durable. Every trimmed or forgotten row cascades a delete through annotations, embeddings, facts, memoria_facts, gists and graph_edges.</p>` },
+	GET: { kind: "write", title: "get / getContext / invalidate / update / forget", html: `<p>Point reads fall back working → episodic → fact rows. getContext orders global scope first, then importance, then recency. invalidate sets valid_until + superseded_by instead of deleting.</p>` },
+	SCR: { kind: "write", title: "scratchpad", html: `<p>Session-scoped transient notes — a separate table, capped reads, explicit clear.</p>` },
+	IMP: { kind: "write", title: "exportToDict / importFromDict", html: `<p>Portable bank transfer. Import is four single-purpose per-table importers; working rows are stamped consolidated so restored banks survive trim (issue #4819); force overwrite cascade-purges stale artifacts.</p>` },
+	REC: { kind: "read", title: "recall / recallEnhanced", html: `<p>The hybrid query pipeline: temporal inference → query embedding (three-state seam) → intent-weighted scoring → candidate collection → per-candidate scoring → dedup/MMR → recall-count bookkeeping. Enhanced forces intent+MMR and fuses facts.</p>` },
+	CAND: { kind: "read", title: "collectMemoryCandidates", html: `<p>Gathers candidates per tier: FTS5 MATCH ranks normalized to 0..1, plus cosine similarity over stored JSON vectors. Visibility (superseded/expired/session scope) is filtered inside SQL so dead rows never consume LIMIT slots.</p>` },
+	SCORE: { kind: "read", title: "scoreCandidate + tierBaseScore", html: `<p>Working tier is keyword-dominated with a superlinear exact-match bonus; episodic tier fuses dense+FTS+importance linearly. Result is multiplied by decay, temporal boost, tier weight, veracity weight; content over 500 chars is clipped with a trailing ellipsis.</p>` },
+	FACT: { kind: "read", title: "factRecall", html: `<p>Atomic triples from <code>facts</code>: FTS5 first, LIKE fallback second, session-scoped with explicit-global visibility. Conversational filler ("what's my name") is stripped unless the filler token appears in the fact itself.</p>` },
+	FMT: { kind: "read", title: "formatContext", html: `<p>Renders results as a sandwich: Top Facts → Supporting Context → Recent Signals, in bullet or JSON form. Consumed by agent hosts for memory injection.</p>` },
+	SLEEP: { kind: "sleep", title: "sleep / sleepAllSessions", html: `<p>The consolidation pipeline: eligible rows (older than TTL/2) are claimed, grouped by source, chunked against maxEpisodeChars, compressed into episodic summaries, logged, then old episodes degrade. sleepAllSessions clones the beam per session.</p>` },
+	CHUNK: { kind: "sleep", title: "splitSleepItems + buildSleepSummary", html: `<p>Keeps episodes under maxEpisodeChars by splitting oversized source groups (nothing dropped), then compresses the joined text with AAAK phrase/structural rewrites. Uses the embed_text projection when present.</p>` },
+	C2E: { kind: "sleep", title: "consolidateToEpisodic", html: `<p>Writes the episodic row (summary_of = source ids, aggregated veracity — ties resolve to the weaker claim), grows the episodic graph (gist + ctx edge), emits MEMORY_CONSOLIDATED. Working rows are only marked, never deleted.</p>` },
+	DEG: { kind: "sleep", title: "degradeEpisodic", html: `<p>One plan-driven loop per tier: tier 1 older than 30 days → tier 2 (hard 800-char clip); tier 2 older than 180 days → tier 3 (keep highest-signal sentences). Rewritten rows lose their vectors.</p>` },
+	SCHEMA: { kind: "shared", title: "schema.ts — initBeam", html: `<p>All DDL in one idempotent function: memory tables, FTS5 mirrors with sync triggers, embeddings, facts, annotations, scratchpad, consolidation log, gists/edges. Reduced copy is fresh-create only.</p>` },
+	HELP: { kind: "shared", title: "helpers.ts", html: `<p>Shared engine math: weight normalization, fast timestamp parsing with cache, recency/temporal decay, lexical relevance with synonyms (English-only), vector encode/decode + exact cosine search, metadata normalization.</p>` },
+	ROW: { kind: "shared", title: "row.ts", html: `<p>Tiny shared accessors for SQLite rows (asString/asNumber/asRows/rowValue) plus the author/type/channel WHERE-fragment builder reused by both stats queries.</p>` },
+	EVT: { kind: "shared", title: "events.ts — emitEvent", html: `<p>Single Observer fanout: one event object goes to the optional eventEmitter and pluginManager sinks. MEMORY_ADDED / MEMORY_UPDATED / MEMORY_CONSOLIDATED are the three event types.</p>` },
+	WM: { kind: "table", title: "working_memory + fts_working", html: `<p>Fast scratch tier. TTL-trimmed, deduped by content, FTS-indexed via triggers (embed_text projection preferred over raw content).</p>` },
+	EM: { kind: "table", title: "episodic_memory + fts_episodes", html: `<p>Durable tier written by sleep, tiered 1→2→3 as it ages; tiers weight recall scoring (1/.85/.7).</p>` },
+	VEC: { kind: "table", title: "memory_embeddings", html: `<p>JSON float vectors keyed by memory id; recall computes exact cosine in memory. Written by hosts/import (the reduced copy does not auto-embed on remember).</p>` },
+	FAC: { kind: "table", title: "facts + fts_facts", html: `<p>Atomic subject-predicate-object triples with confidence; surfaced by factRecall and resolvable read-only through get() (issue #4725).</p>` },
+	AAAK: { kind: "ext", title: "aaak.ts (outside beam/)", html: `<p>Lossy text compression: phrase map ("User prefers " → "PREF "), structural rewrites (" and " → "+", " in " → ":"), punctuation compaction. Sleep's compressor.</p>` },
+	GRAPH: { kind: "ext", title: "episodic-graph.ts (outside beam/)", html: `<p>gist_<id> rows + ctx/related_to edges in graph_edges. Consolidation and proactive linking grow it; Jaccard ≥ 0.35 links similar memories.</p>` },
+	EMB: { kind: "ext", title: "embeddings.ts (outside beam/)", html: `<p>Provider seam: constructor-scoped provider → test provider → OpenAI-compatible endpoint → local-model initializer hook. Query vectors cached per (provider, model, url, text).</p>` },
+	LEX: { kind: "ext", title: "query-intent · mmr · synonyms · temporal-parser · vector-math", html: `<p>Query understanding and post-processing: intent classification rebalances weights, MMR diversifies results, synonyms expand tokens, the NL date parser feeds temporal boosting.</p>` },
+	HOSTS: { kind: "ext", title: "agent hosts (outside)", html: `<p>Consumers of the engine — the coding-agent memory tools, MCP server, CLI — inject memories via remember and receive formatted context from formatContext for system-prompt injection.</p>` },
+};
+
+const KIND_COLORS = {
+	write: "#1d4ed8", read: "#047857", sleep: "#c2410c",
+	shared: "#be185d", table: "#6d28d9", ext: "#0e7490", hub: "#a16207",
+};
+
+function nameFromNode(node) {
+	const id = node.id || "";
+	const match = id.match(/-flowchart-(.+?)-\d+$/);
+	return match ? match[1] : null;
+}
+
+const info = document.getElementById("info");
+const defaultInfo = info.innerHTML;
+
+function showInfo(key) {
+	const doc = DOCS[key];
+	if (!doc) return;
+	const color = KIND_COLORS[doc.kind] ?? "#475569";
+	info.innerHTML = `
+		<span class="kind" style="background:${color}1a;color:${color}">${doc.kind}</span>
+		<h2>${doc.title}</h2>
+		${doc.html}`;
+}
+
+svg.addEventListener("click", event => {
+	const node = event.target.closest("g.node, g.cluster");
+	if (node) {
+		const key = nameFromNode(node) ?? (node.id || "").replace(/-cluster-\d+$/, "");
+		if (DOCS[key]) {
+			svg.classList.add("dimmed");
+			svg.querySelectorAll(".hot").forEach(el => el.classList.remove("hot"));
+			node.classList.add("hot");
+			showInfo(key);
+			return;
+		}
+	}
+	svg.classList.remove("dimmed");
+	svg.querySelectorAll(".hot").forEach(el => el.classList.remove("hot"));
+	info.innerHTML = defaultInfo;
+});
+</script>
+</body>
+</html>
