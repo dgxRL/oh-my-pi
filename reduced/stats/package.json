@@ -1,0 +1,10 @@
+{
+	"name": "stats-reduced",
+	"version": "18.2.1",
+	"type": "module",
+	"description": "Educational reduced copy of packages/stats: session JSONL -> incremental sync -> SQLite -> dashboard APIs (English-only, flat cost rate)",
+	"private": true,
+	"scripts": {
+		"test": "bun test"
+	}
+}
