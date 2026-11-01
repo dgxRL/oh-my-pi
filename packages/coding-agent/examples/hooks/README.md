@@ -20,6 +20,8 @@ cp permission-gate.ts ~/.omp/agent/hooks/pre/
 | `git-checkpoint.ts`      | Creates git stash checkpoints at each turn for code restoration on branch      |
 | `protected-paths.ts`     | Blocks writes to protected paths (.env, .git/, node_modules/)                  |
 | `file-trigger.ts`        | Watches a trigger file and injects contents into conversation                  |
+| `cron-trigger.ts`        | Wakes the agent on cron schedules from a JSON file (re-read every tick)        |
+| `webhook-trigger.ts`     | localhost HTTP listener turning POSTed JSON payloads into agent turns          |
 | `confirm-destructive.ts` | Confirms before destructive session actions (clear, switch, branch)            |
 | `dirty-repo-guard.ts`    | Prevents session changes with uncommitted git changes                          |
 | `auto-commit-on-exit.ts` | Auto-commits on exit using last assistant message for commit message           |
